@@ -1,0 +1,12 @@
+{
+  "name": "utbot-worker",
+  "version": "1.0.0",
+  "description": "UT Bot Paper Trading Worker — runs 24/7 on Render",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

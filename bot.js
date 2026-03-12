@@ -9,7 +9,7 @@ const https = require('https');
 const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
-const JSONBIN_KEY      = '$2a$10$O7ugawOSpBk0bEaKB8s4wOKZNVE2G9VjfCGTtEUb8tGmTmmx2xYYm';
+const JSONBIN_KEY = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
 const JSONBIN_BASE     = 'https://api.jsonbin.io/v3';
 const START_BALANCE    = 10000;
 const BTC_USDT_RATE    = 85;

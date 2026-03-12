@@ -9,7 +9,7 @@ const https = require('https');
 const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
-const JSONBIN_KEY = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
+const JSONBIN_KEY      = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
 const JSONBIN_BASE     = 'https://api.jsonbin.io/v3';
 const START_BALANCE    = 10000;
 const BTC_USDT_RATE    = 85;
@@ -211,9 +211,9 @@ function processSignal(candles) {
 // ── FETCH CANDLES (tries 3 endpoints) ────────────────────────────
 async function fetchCandles() {
     var endpoints = [
+        'https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit='    + CANDLE_LIMIT,
         'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=' + CANDLE_LIMIT,
-        'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit='   + CANDLE_LIMIT,
-        'https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=5m&limit='    + CANDLE_LIMIT
+        'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit='   + CANDLE_LIMIT
     ];
 
     for (var i = 0; i < endpoints.length; i++) {

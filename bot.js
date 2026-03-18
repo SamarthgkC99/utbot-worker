@@ -21,33 +21,41 @@ const PORT             = process.env.PORT || 3000;
 let _state_ref = null;
 
 http.createServer((req, res) => {
-    if (req.url === '/health' || req.url === '/') {
-        const s   = _state_ref;
-        const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        const trade = s?.open_trade;
-        const totalPL = s?.history?.reduce((a, b) => a + b.profit_inr, 0) ?? 0;
+    const url = req.url.split('?')[0];
+
+    // OPTIONS preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS' });
+        res.end(); return;
+    }
+
+    if (url === '/ping') {
+        // Ultra-tiny response for cron-job.org
+        res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+        res.end('OK');
+
+    } else if (url === '/health' || url === '/') {
+        const s       = _state_ref;
+        const trade   = s?.open_trade;
+        const totalPL = s?.history?.reduce((a,b) => a+b.profit_inr, 0) ?? 0;
         const wins    = s?.history?.filter(t => t.profit_inr > 0).length ?? 0;
-        const body = JSON.stringify({
-            status:       'running ✅',
-            time_ist:     now,
-            balance_inr:  s ? '₹' + s.balance.toFixed(2) : 'loading...',
+        const body    = JSON.stringify({
+            status:       'running',
+            time_ist:     new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+            balance_inr:  s ? s.balance.toFixed(2) : '0',
             open_trade:   trade ? trade.type + ' @ $' + trade.entry_price.toFixed(2) : 'none',
             trades_today: s?.daily_stats?.trades ?? 0,
-            win_rate:     s?.history?.length ? Math.round(wins / s.history.length * 100) + '%' : '0%',
-            total_pl:     '₹' + totalPL.toFixed(2)
-        }, null, 2);
-        res.writeHead(200, {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS'
+            win_rate:     s?.history?.length ? Math.round(wins/s.history.length*100)+'%' : '0%',
+            total_pl:     totalPL.toFixed(2)
         });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(body);
+
     } else {
-        res.writeHead(404);
-        res.end('Not found');
+        res.writeHead(404); res.end('Not found');
     }
 }).listen(PORT, () => {
-    console.log('🌐 HTTP server on port ' + PORT + ' — UptimeRobot should ping /health');
+    console.log('🌐 HTTP server on port ' + PORT);
 });
 
 // ── HTTP FETCH (no npm deps, handles redirects) ───────────────────

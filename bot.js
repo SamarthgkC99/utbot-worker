@@ -36,7 +36,11 @@ http.createServer((req, res) => {
             win_rate:     s?.history?.length ? Math.round(wins / s.history.length * 100) + '%' : '0%',
             total_pl:     '₹' + totalPL.toFixed(2)
         }, null, 2);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS'
+        });
         res.end(body);
     } else {
         res.writeHead(404);

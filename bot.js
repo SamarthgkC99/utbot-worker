@@ -9,8 +9,9 @@ const https = require('https');
 const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
-const JSONBIN_KEY      = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
-const JSONBIN_BASE     = 'https://api.jsonbin.io/v3';
+// ── Firebase Config — replace with your own ──────────────
+const FIREBASE_URL = 'https://utbot-trading-default-rtdb.firebaseio.com'; // e.g. https://your-project-default-rtdb.firebaseio.com
+const FIREBASE_PATH = '/bot1'; // path in database
 const START_BALANCE    = 10000;
 const BTC_USDT_RATE    = 85;
 const LOOP_INTERVAL_MS = 5000;
@@ -99,7 +100,6 @@ function fetchJSON(url, options, redirectCount) {
 }
 
 // ── JSONBIN STATE STORAGE ─────────────────────────────────────────
-var _binId = null;
 
 async function getState() {
     try {
@@ -327,11 +327,9 @@ async function runLoop(state) {
     // ── Sync config from JSONBin every loop ──
     // This allows dashboard pause/resume/force buttons to work
     try {
-        var remote = await fetchJSON(JSONBIN_BASE + '/b/' + _binId + '/latest', {
-            headers: { 'X-Master-Key': JSONBIN_KEY }
-        });
-        if (remote && remote.record && !remote.record.empty) {
-            var r = remote.record;
+        var remote = await fetchJSON(FIREBASE_URL + FIREBASE_PATH + '.json');
+        if (remote && !remote.null) {
+            var r = remote;
             // Only sync config — don't overwrite local trade state
             if (r.config) {
                 state.config.manual_pause = r.config.manual_pause;

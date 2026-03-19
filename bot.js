@@ -283,6 +283,7 @@ function openTrade(state, type, price, atr, utbotStop) {
         amount:      0.001,
         stop_loss:   sl,
         tp1:         tp,
+        rr_mode:     '1:1',
         opened_at:   Date.now()
     };
     console.log('📈 Opened ' + state.open_trade.type + ' @ $' + price.toFixed(2) +
@@ -305,6 +306,9 @@ function closeTrade(state, price, reason) {
         exit_price:  price,
         profit_inr:  inrPL,
         exit_reason: reason,
+        amount:      trade.amount,
+        rr_mode:     trade.rr_mode || '1:1',
+        opened_at:   trade.opened_at,
         time:        Date.now()
     });
     state.daily_stats.trades++;
@@ -320,6 +324,42 @@ function closeTrade(state, price, reason) {
 var lastTradeCloseTime = 0;
 
 async function runLoop(state) {
+    // ── Sync config from JSONBin every loop ──
+    // This allows dashboard pause/resume/force buttons to work
+    try {
+        var remote = await fetchJSON(JSONBIN_BASE + '/b/' + _binId + '/latest', {
+            headers: { 'X-Master-Key': JSONBIN_KEY }
+        });
+        if (remote && remote.record && !remote.record.empty) {
+            var r = remote.record;
+            // Only sync config — don't overwrite local trade state
+            if (r.config) {
+                state.config.manual_pause = r.config.manual_pause;
+                state.config.force_start  = r.config.force_start;
+                if (r.config.risk) {
+                    state.config.risk.max_trades    = r.config.risk.max_trades;
+                    state.config.risk.max_daily_loss = r.config.risk.max_daily_loss;
+                }
+            }
+            // If dashboard force-closed a trade
+            if (!r.open_trade && state.open_trade) {
+                console.log('📋 Dashboard closed trade — syncing');
+                state.open_trade   = null;
+                state.history      = r.history      || state.history;
+                state.balance      = r.balance      || state.balance;
+                state.daily_stats  = r.daily_stats  || state.daily_stats;
+            }
+            // Sync history clear if dashboard cleared it
+            if (r.history && r.history.length === 0 && state.history.length > 0) {
+                console.log('📋 Dashboard cleared history — syncing');
+                state.history     = [];
+                state.balance     = r.balance     || state.balance;
+                state.daily_stats = r.daily_stats || state.daily_stats;
+            }
+        }
+    } catch(e) { console.warn('⚠️  Config sync error:', e.message); }
+
+    // ── Daily reset ──
     var today = new Date().toDateString();
     if (state.daily_stats.date !== today) {
         console.log('🔄 Daily reset');
@@ -334,6 +374,12 @@ async function runLoop(state) {
     var signal= sig.signal;
     var atr   = sig.atr;
     var stop  = sig.stop;
+
+    // Save signal data to state so dashboard can display it
+    state.last_signal  = signal;
+    state.last_atr     = atr;
+    state.last_price   = price;
+    state.last_ut_stop = stop;
 
     console.log('[' + new Date().toLocaleTimeString() + '] BTC: $' + price.toFixed(2) + ' | Signal: ' + signal);
 

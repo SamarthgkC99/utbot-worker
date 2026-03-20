@@ -10,7 +10,7 @@ const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
 // ── JSONBin Config ───────────────────────────────────────
-const JSONBIN_KEY  = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
+const JSONBIN_KEY  = '$2a$10$icBNaV0ugWoaHVVSzZqndu5DBe37.ueXijajnCTsCPs1K4pkW2QOy';
 const JSONBIN_BASE = 'https://api.jsonbin.io/v3';
 var _binId = null;
 

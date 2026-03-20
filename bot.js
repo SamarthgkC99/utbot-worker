@@ -333,12 +333,29 @@ let lastTradeCloseTime = 0;
 const COOLDOWN_MS = 5 * 60 * 1000;
 
 // ── Main Loop ─────────────────────────────────────────────
+// ── Session Check (6 PM – 11 PM IST = 12:30 UTC – 17:30 UTC) ──
+function isInSession() {
+    const now    = new Date();
+    const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const start  = 12 * 60 + 30;  // 12:30 UTC = 18:00 IST
+    const end    = 17 * 60 + 30;  // 17:30 UTC = 23:00 IST
+    return utcMin >= start && utcMin < end;
+}
+
 async function runLoop() {
     // Daily reset
     const today = new Date().toDateString();
     if (state.daily_stats.date !== today) {
         console.log('🔄 Daily reset');
         state.daily_stats = { trades: 0, loss: 0, profit: 0, date: today };
+    }
+
+    // ── Session filter — only trade 6 PM to 11 PM IST ──────
+    if (!state.config.force_start && !isInSession()) {
+        const istTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+        console.log('[' + istTime + ' IST] Outside session (18:00-23:00) — skipping Binance API call');
+        state.last_signal = 'Hold';
+        return;
     }
 
     const candles = await fetchCandles('5m', CANDLE_LIMIT);

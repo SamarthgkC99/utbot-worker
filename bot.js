@@ -10,7 +10,21 @@ const http  = require('http');
 // ── Config ────────────────────────────────────────────────
 const PORT             = process.env.PORT || 3000;
 const START_BALANCE    = 10000;
-const BTC_USDT_RATE    = 85;
+let BTC_USDT_RATE = 85; // updated hourly from live API
+
+// ── Fetch live USDT/INR rate (once per hour) ──────────────
+async function updateUSDTRate() {
+    try {
+        // ExchangeRate-API free tier — no key needed for basic pairs
+        const res = await fetchJSON('https://open.er-api.com/v6/latest/USD');
+        if (res && res.rates && res.rates.INR) {
+            BTC_USDT_RATE = parseFloat(res.rates.INR.toFixed(2));
+            console.log('💱 USDT/INR rate updated: ₹' + BTC_USDT_RATE);
+        }
+    } catch(e) {
+        console.warn('⚠️  Rate fetch failed, using last known: ₹' + BTC_USDT_RATE);
+    }
+}
 const LOOP_INTERVAL_MS = 5000;
 const CANDLE_LIMIT     = 350;
 const UPSTASH_URL      = 'https://robust-kitten-78595.upstash.io';
@@ -281,7 +295,20 @@ function isTradingAllowed() {
     return { allowed: true };
 }
 
-function openTrade(signal, price, atr, utbotStop) {
+function calcLotSize(balance, atr, price, prevAtr) {
+    // ATR expanding = strong momentum = 2% risk, else 1% risk
+    const riskPct    = (prevAtr && atr > prevAtr) ? 0.02 : 0.01;
+    const riskINR    = balance * riskPct;
+    const slDistUSDT = atr * 1.5;                          // SL distance in USDT
+    const slDistINR  = slDistUSDT * BTC_USDT_RATE;        // SL distance in INR
+    if (slDistINR <= 0) return 0.001;
+    const rawLot = riskINR / slDistINR;                    // lot in BTC
+    const lot    = Math.max(0.0001, Math.min(0.002, parseFloat(rawLot.toFixed(4))));
+    console.log(`📐 Lot size: ${lot} BTC | Risk: ${riskPct*100}% (${riskINR.toFixed(2)} INR) | ATR expanding: ${prevAtr && atr > prevAtr}`);
+    return lot;
+}
+
+function openTrade(signal, price, atr, utbotStop, prevAtr) {
     let sl, tp;
     if (signal === 'Buy') {
         sl = Math.max(price - 2 * atr, utbotStop);
@@ -290,16 +317,17 @@ function openTrade(signal, price, atr, utbotStop) {
         sl = Math.min(price + 2 * atr, utbotStop);
         tp = price - 2 * atr;
     }
+    const amount = calcLotSize(state.balance, atr, price, prevAtr);
     state.open_trade = {
         type:        signal === 'Buy' ? 'LONG' : 'SHORT',
         entry_price: price,
-        amount:      0.001,
+        amount:      amount,
         stop_loss:   sl,
         tp1:         tp,
         rr_mode:     '1:1',
         opened_at:   Date.now()
     };
-    console.log(`📈 Opened ${state.open_trade.type} @ $${price.toFixed(2)} | SL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)}`);
+    console.log(`📈 Opened ${state.open_trade.type} @ $${price.toFixed(2)} | SL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)} | Lot: ${amount} BTC`);
 }
 
 function closeTrade(price, reason) {
@@ -362,10 +390,18 @@ async function runLoop() {
     if (!candles) return;
 
     const { price, signal, atr, stop } = processSignal(candles);
-    state.last_price   = price;
-    state.last_signal  = signal;
-    state.last_atr     = atr;
-    state.last_ut_stop = stop;
+    state.last_price    = price;
+    state.last_signal   = signal;
+    state.last_atr      = atr;
+    state.last_ut_stop  = stop;
+    state.usdt_inr_rate = BTC_USDT_RATE;
+    const atr14     = calcATR(candles, 14);
+    const n         = candles.length;
+    const prevAtr14 = atr14[n - 11] || 0;
+    state.last_prev_atr  = prevAtr14;
+    state.last_atr_expanding = atr > prevAtr14;
+    // Preview next lot size
+    state.last_lot_preview = calcLotSize(state.balance, atr, price, prevAtr14);
 
     console.log(`[${new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'})} IST] BTC: $${price.toFixed(2)} | Signal: ${signal}`);
 
@@ -394,7 +430,8 @@ async function runLoop() {
         const tradesOk   = state.daily_stats.trades < state.config.risk.max_trades;
         const lossOk     = state.daily_stats.loss   < state.config.risk.max_daily_loss;
         if (cooldownOk && tradesOk && lossOk) {
-            openTrade(signal, price, atr, stop);
+            const prevAtr = atr14[n - 11] || 0; // ATR 10 candles ago
+            openTrade(signal, price, atr, stop, prevAtr);
             await saveState();
         } else {
             console.log('  Signal skipped — cooldown/limits');
@@ -406,6 +443,8 @@ async function runLoop() {
 async function main() {
     console.log('🤖 Bot 1 (UT Bot) starting...');
     await loadState();
+    await updateUSDTRate();           // fetch rate on startup
+    setInterval(updateUSDTRate, 60 * 60 * 1000); // refresh every hour
     await runLoop();
     setInterval(runLoop, LOOP_INTERVAL_MS);
 }

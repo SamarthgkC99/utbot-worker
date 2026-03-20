@@ -322,23 +322,22 @@ function calcUTBot(candles, keyValue, atrPeriod) {
 // ── Signal Processing ─────────────────────────────────────
 function processSignal(candles) {
     const closes = candles.map(c => c.close);
-    const highs  = candles.map(c => c.high);
-    const lows   = candles.map(c => c.low);
     const n      = closes.length;
 
     const utBot2 = calcUTBot(candles, 2, 300);
     const utBot1 = calcUTBot(candles, 2, 1);
 
-    const signalBuy  = utBot2.pos[n-1] ===  1 ? 'Buy'  : 'Hold';
-    const signalSell = utBot1.pos[n-1] === -1 ? 'Sell' : 'Hold';
+    // Signal only on CROSSOVER (position change), not every bar
+    const buySignal  = utBot2.pos[n-1] ===  1 && utBot2.pos[n-2] !== 1;
+    const sellSignal = utBot1.pos[n-1] === -1 && utBot1.pos[n-2] !== -1;
 
     let signal = 'Hold';
-    if (signalBuy  === 'Buy')  signal = 'Buy';
-    if (signalSell === 'Sell') signal = 'Sell';
+    if (buySignal)  signal = 'Buy';
+    if (sellSignal) signal = 'Sell';
 
     const atr14 = calcATR(candles, 14);
     const atr   = atr14[n-1] || 0;
-    const stop  = signal === 'Buy' ? utBot2.stop[n-1] : utBot1.stop[n-1];
+    const stop  = utBot2.pos[n-1] === 1 ? utBot2.stop[n-1] : utBot1.stop[n-1];
 
     return { price: closes[n-1], signal, atr, stop, utBot2, utBot1 };
 }

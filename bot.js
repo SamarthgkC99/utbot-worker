@@ -9,10 +9,10 @@ const https = require('https');
 const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
-// ── GitHub Database Config ───────────────────────────────
-const GITHUB_USER  = 'SamarthgkC99';
-const GITHUB_TOKEN = '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';
-const GITHUB_REPO  = 'bot-state';
+// ── JSONBin Config ───────────────────────────────────────
+const JSONBIN_KEY  = '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu';
+const JSONBIN_BASE = 'https://api.jsonbin.io/v3';
+var _binId = null;
 
 const START_BALANCE    = 10000;
 const BTC_USDT_RATE    = 85;
@@ -106,34 +106,27 @@ function fetchJSON(url, options, redirectCount) {
 async function getState() {
     try {
         if (!_binId) {
-            var res = await fetchJSON(JSONBIN_BASE + '/b', {
+            var res = await fetchJSON('https://api.jsonbin.io/v3/b', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'X-Master-Key': JSONBIN_KEY,
-                    'X-Bin-Name':   'utbot-state',
-                    'X-Bin-Private':'true'
+                    'Content-Type':  'application/json',
+                    'X-Master-Key':  '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu',
+                    'X-Bin-Name':    'utbot-state',
+                    'X-Bin-Private': 'true'
                 },
                 body: JSON.stringify({ empty: true })
             });
-            console.log('JSONBin create response:', JSON.stringify(res).slice(0, 200));
-            _binId = (res.metadata && res.metadata.id) ? res.metadata.id : null;
-            if (_binId) {
-                console.log('📦 JSONBin ID: ' + _binId + '  ← copy this into your index.html!');
-            } else {
-                console.error('❌ Could not create JSONBin. Response:', JSON.stringify(res));
-            }
+            _binId = res.metadata && res.metadata.id ? res.metadata.id : null;
+            if (_binId) console.log('📦 JSONBin ID: ' + _binId + '  ← copy this into your index.html!');
+            else console.error('❌ Could not create JSONBin:', JSON.stringify(res));
             return null;
         }
-        var res2 = await fetchJSON(JSONBIN_BASE + '/b/' + _binId + '/latest', {
-            headers: { 'X-Master-Key': JSONBIN_KEY }
+        var res2 = await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId + '/latest', {
+            headers: { 'X-Master-Key': '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu' }
         });
         if (res2.record && res2.record.empty) return null;
         return res2.record || null;
-    } catch(e) {
-        console.warn('⚠️  JSONBin read error:', e.message);
-        return null;
-    }
+    } catch(e) { console.warn('⚠️  JSONBin read error:', e.message); return null; }
 }
 
 async function setState(state) {
@@ -141,17 +134,12 @@ async function setState(state) {
         if (!_binId) { await getState(); }
         if (!_binId) { console.warn('⚠️  No binId, skipping save'); return; }
         state.daily_stats.lastUpdated = Date.now();
-        await fetchJSON(JSONBIN_BASE + '/b/' + _binId, {
+        await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId, {
             method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': JSONBIN_KEY
-            },
+            headers: { 'Content-Type': 'application/json', 'X-Master-Key': '$2a$10$icBNaV0ugWoaHVVSzZqndu5DBe37.ueXijajnCTsCPs1K4pkW2QOy' },
             body: JSON.stringify(state)
         });
-    } catch(e) {
-        console.warn('⚠️  JSONBin write error:', e.message);
-    }
+    } catch(e) { console.warn('⚠️  JSONBin write error:', e.message); }
 }
 
 // ── ATR & UT BOT MATH ─────────────────────────────────────────────
@@ -329,11 +317,11 @@ async function runLoop(state) {
     // ── Sync config from JSONBin every loop ──
     // This allows dashboard pause/resume/force buttons to work
     try {
-        var remote = await fetchJSON('https://api.github.com/repos/' + GITHUB_USER + '/' + GITHUB_REPO + '/contents/bot1_state.json', {
-            headers: { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'UTBot-Trading/1.0' }
+        var remote = await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId + '/latest', {
+            headers: { 'X-Master-Key': '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu' }
         });
-        if (remote && remote.content) {
-            var r = JSON.parse(Buffer.from(remote.content.replace(/\n/g,''), 'base64').toString('utf8'));
+        if (remote && remote.record && !remote.record.empty) {
+            var r = remote.record;
             // Only sync config — don't overwrite local trade state
             if (r.config) {
                 state.config.manual_pause = r.config.manual_pause;

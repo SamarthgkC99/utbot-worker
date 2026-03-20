@@ -330,7 +330,7 @@ async function runLoop(state) {
     // This allows dashboard pause/resume/force buttons to work
     try {
         var remote = await fetchJSON('https://api.github.com/repos/' + GITHUB_USER + '/' + GITHUB_REPO + '/contents/bot1_state.json', {
-            headers: { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json' }
+            headers: { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'UTBot-Trading/1.0' }
         });
         if (remote && remote.content) {
             var r = JSON.parse(Buffer.from(remote.content.replace(/\n/g,''), 'base64').toString('utf8'));

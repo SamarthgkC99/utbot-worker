@@ -10,7 +10,7 @@ const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
 // ── JSONBin Config ───────────────────────────────────────
-const JSONBIN_KEY  = '$2a$10$icBNaV0ugWoaHVVSzZqndu5DBe37.ueXijajnCTsCPs1K4pkW2QOy';
+const JSONBIN_KEY  = '$2a$10$LRSRMzfLJUkmAYV.UNPU9Oktvo8bK0XLY9loF3LobbOnJO/pqHDmq';
 const JSONBIN_BASE = 'https://api.jsonbin.io/v3';
 var _binId = null;
 
@@ -110,7 +110,7 @@ async function getState() {
                 method: 'POST',
                 headers: {
                     'Content-Type':  'application/json',
-                    'X-Master-Key':  '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu',
+                    'X-Master-Key':  '$2a$10$LRSRMzfLJUkmAYV.UNPU9Oktvo8bK0XLY9loF3LobbOnJO/pqHDmq',
                     'X-Bin-Name':    'utbot-state',
                     'X-Bin-Private': 'true'
                 },
@@ -122,7 +122,7 @@ async function getState() {
             return null;
         }
         var res2 = await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId + '/latest', {
-            headers: { 'X-Master-Key': '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu' }
+            headers: { 'X-Master-Key': '$2a$10$LRSRMzfLJUkmAYV.UNPU9Oktvo8bK0XLY9loF3LobbOnJO/pqHDmq' }
         });
         if (res2.record && res2.record.empty) return null;
         return res2.record || null;
@@ -136,7 +136,7 @@ async function setState(state) {
         state.daily_stats.lastUpdated = Date.now();
         await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json', 'X-Master-Key': '$2a$10$icBNaV0ugWoaHVVSzZqndu5DBe37.ueXijajnCTsCPs1K4pkW2QOy' },
+            headers: { 'Content-Type': 'application/json', 'X-Master-Key': '$2a$10$LRSRMzfLJUkmAYV.UNPU9Oktvo8bK0XLY9loF3LobbOnJO/pqHDmq' },
             body: JSON.stringify(state)
         });
     } catch(e) { console.warn('⚠️  JSONBin write error:', e.message); }
@@ -318,7 +318,7 @@ async function runLoop(state) {
     // This allows dashboard pause/resume/force buttons to work
     try {
         var remote = await fetchJSON('https://api.jsonbin.io/v3/b/' + _binId + '/latest', {
-            headers: { 'X-Master-Key': '$2a$10$89MGgEAgjXyETvQ4x/vEpO.2NeEiLaR7nr.4oYSl1uaOr3VihCFtu' }
+            headers: { 'X-Master-Key': '$2a$10$LRSRMzfLJUkmAYV.UNPU9Oktvo8bK0XLY9loF3LobbOnJO/pqHDmq' }
         });
         if (remote && remote.record && !remote.record.empty) {
             var r = remote.record;

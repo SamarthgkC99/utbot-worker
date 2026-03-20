@@ -11,7 +11,7 @@ const http  = require('http');
 // ── CONFIG ────────────────────────────────────────────────────────
 // ── GitHub Database Config ───────────────────────────────
 const GITHUB_USER  = 'SamarthgkC99';
-const GITHUB_TOKEN = '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';
+const GITHUB_TOKEN = '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';
 const GITHUB_REPO  = 'bot-state';
 
 const START_BALANCE    = 10000;

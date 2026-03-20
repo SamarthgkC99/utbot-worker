@@ -110,7 +110,7 @@ http.createServer((req, res) => {
             const candles = _lastCandles;
             if (!candles || candles.length === 0) {
                 res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ candles: [], stop_line: [], signals: [] }));
+                res.end(JSON.stringify({ candles: [], stop_line: [], signals: [], utbot_pos: [] }));
                 return;
             }
             // Last 150 candles for chart
@@ -149,7 +149,14 @@ http.createServer((req, res) => {
             }));
 
             res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ candles: chartCandles, stop_line: stopLine, signals }));
+            
+            // ✅ FIXED: Added utbot_pos so frontend can color the line Green/Red
+            res.end(JSON.stringify({ 
+                candles: chartCandles, 
+                stop_line: stopLine, 
+                signals,
+                utbot_pos: utBot2.pos 
+            }));
         } catch(e) {
             res.writeHead(500, headers);
             res.end(JSON.stringify({ error: e.message }));

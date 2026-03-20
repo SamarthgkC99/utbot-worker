@@ -32,6 +32,8 @@ const UPSTASH_TOKEN    = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMW
 const REDIS_KEY        = 'bot1_state';
 
 // ── In-memory state ───────────────────────────────────────
+let _lastCandles = []; // stored for chart endpoint
+
 let state = {
     balance:      START_BALANCE,
     open_trade:   null,
@@ -99,6 +101,59 @@ http.createServer((req, res) => {
     if (url === '/state' && req.method === 'GET') {
         res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
         res.end(JSON.stringify(state));
+        return;
+    }
+
+    // Chart data endpoint — pre-processed candles + indicators
+    if (url === '/chart-data' && req.method === 'GET') {
+        try {
+            const candles = _lastCandles;
+            if (!candles || candles.length === 0) {
+                res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ candles: [], stop_line: [], signals: [] }));
+                return;
+            }
+            // Last 150 candles for chart
+            const slice   = candles.slice(-150);
+            const closes  = slice.map(c => c.close);
+            const highs   = slice.map(c => c.high);
+            const lows    = slice.map(c => c.low);
+
+            // UT Bot stop line
+            const utBot2  = calcUTBot(slice, 2, 300);
+            const utBot1  = calcUTBot(slice, 2, 1);
+
+            const stopLine = utBot2.stop.map((v, i) => ({
+                time:  Math.floor(slice[i].time / 1000),
+                value: parseFloat(v.toFixed(2))
+            }));
+
+            // Signals
+            const signals = [];
+            for (let i = 1; i < utBot2.pos.length; i++) {
+                if (utBot2.pos[i] === 1 && utBot2.pos[i-1] !== 1) {
+                    signals.push({ type: 'buy',  time: Math.floor(slice[i].time/1000), price: slice[i].close });
+                }
+                if (utBot1.pos[i] === -1 && utBot1.pos[i-1] !== -1) {
+                    signals.push({ type: 'sell', time: Math.floor(slice[i].time/1000), price: slice[i].close });
+                }
+            }
+
+            const chartCandles = slice.map(c => ({
+                time:   Math.floor(c.time / 1000),
+                open:   c.open,
+                high:   c.high,
+                low:    c.low,
+                close:  c.close,
+                volume: c.volume
+            }));
+
+            res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ candles: chartCandles, stop_line: stopLine, signals }));
+        } catch(e) {
+            res.writeHead(500, headers);
+            res.end(JSON.stringify({ error: e.message }));
+        }
         return;
     }
 
@@ -388,6 +443,7 @@ async function runLoop() {
 
     const candles = await fetchCandles('5m', CANDLE_LIMIT);
     if (!candles) return;
+    _lastCandles = candles; // store for /chart-data endpoint
 
     const { price, signal, atr, stop } = processSignal(candles);
     state.last_price    = price;

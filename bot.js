@@ -9,9 +9,11 @@ const https = require('https');
 const http  = require('http');
 
 // ── CONFIG ────────────────────────────────────────────────────────
-// ── Firebase Config — replace with your own ──────────────
-const FIREBASE_URL = 'https://utbot-trading-default-rtdb.firebaseio.com'; // e.g. https://your-project-default-rtdb.firebaseio.com
-const FIREBASE_PATH = '/bot1'; // path in database
+// ── GitHub Database Config ───────────────────────────────
+const GITHUB_USER  = 'SamarthgkC99';
+const GITHUB_TOKEN = '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';
+const GITHUB_REPO  = 'bot-state';
+
 const START_BALANCE    = 10000;
 const BTC_USDT_RATE    = 85;
 const LOOP_INTERVAL_MS = 5000;
@@ -327,9 +329,11 @@ async function runLoop(state) {
     // ── Sync config from JSONBin every loop ──
     // This allows dashboard pause/resume/force buttons to work
     try {
-        var remote = await fetchJSON(FIREBASE_URL + FIREBASE_PATH + '.json');
-        if (remote && !remote.null) {
-            var r = remote;
+        var remote = await fetchJSON('https://api.github.com/repos/' + GITHUB_USER + '/' + GITHUB_REPO + '/contents/bot1_state.json', {
+            headers: { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json' }
+        });
+        if (remote && remote.content) {
+            var r = JSON.parse(Buffer.from(remote.content.replace(/\n/g,''), 'base64').toString('utf8'));
             // Only sync config — don't overwrite local trade state
             if (r.config) {
                 state.config.manual_pause = r.config.manual_pause;

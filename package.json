@@ -1,12 +1,16 @@
 {
-  "name": "utbot-worker",
+  "name": "utbot-trading-backend",
   "version": "1.0.0",
-  "description": "UT Bot Paper Trading Worker — runs 24/7 on Render",
+  "description": "UT Bot BTCUSDT Demo Trader — Node.js backend for Render",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
   }
 }

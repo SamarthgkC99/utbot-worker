@@ -13,8 +13,8 @@ app.use(express.json());
 
 // ─── Upstash Redis Credentials ────────────────────────────────────────────────
 // Paste your Upstash credentials here directly:
-const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
-const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
+const REDIS_URL   = 'YOUR_UPSTASH_REDIS_REST_URL';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'YOUR_UPSTASH_REDIS_REST_TOKEN';  // e.g. AXxxxxxxxxxxxxxxxx
 
 async function redisCmd(...args) {
   const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
@@ -166,119 +166,129 @@ async function fetchKlines(limit = 350) {
 
 // ─── UT Bot Logic ─────────────────────────────────────────────────────────────
 function calcUTBot(klines, keyvalue, atrPeriod) {
+  // ── Exact Pine Script port ──────────────────────────────────────────────────
+  // Pine uses Wilder's RMA (EMA-style) for ATR, but the Python version uses SMA.
+  // We match the Python/original utbot_logic.py here: SMA rolling ATR.
   if (!klines || klines.length < 2) return null;
   const n     = klines.length;
   const close = klines.map(k => parseFloat(k[4]));
   const high  = klines.map(k => parseFloat(k[2]));
   const low   = klines.map(k => parseFloat(k[3]));
+  const tr    = high.map((h, i) => h - low[i]);  // TR = high - low (matches Python)
 
-  // True Range = high - low (matching Python: df["tr"] = df["high"] - df["low"])
-  const tr = high.map((h, i) => h - low[i]);
-
-  // Rolling ATR — same as Python pandas rolling().mean()
-  // For indices before atrPeriod-1, use average of available values (pandas NaN → we use 0)
+  // SMA rolling ATR
   const atr = new Array(n).fill(0);
   for (let i = 0; i < n; i++) {
-    if (i < atrPeriod - 1) {
-      // not enough data yet — use average of what we have (avoids 0 nLoss early on)
-      atr[i] = tr.slice(0, i + 1).reduce((s, v) => s + v, 0) / (i + 1);
-    } else {
-      atr[i] = tr.slice(i - atrPeriod + 1, i + 1).reduce((s, v) => s + v, 0) / atrPeriod;
-    }
+    const window = tr.slice(Math.max(0, i - atrPeriod + 1), i + 1);
+    atr[i] = window.reduce((s, v) => s + v, 0) / window.length;
   }
-
   const nLoss = atr.map(a => keyvalue * a);
 
-  // Trailing stop — exact port of Python loop
-  const stop = [close[0]];
-  const pos  = [0];
+  // ── Trailing stop (Pine Script iff logic) ───────────────────────────────────
+  // nz(xATRTrailingStop[1], 0) → previous stop, defaulting to 0
+  const stop = new Array(n).fill(0);
+  stop[0] = close[0];  // initialise first candle
 
   for (let i = 1; i < n; i++) {
-    const prev = stop[i - 1];
-    const src  = close[i];
-    const src1 = close[i - 1];
-    let newStop;
+    const prevStop = stop[i - 1];
+    const src      = close[i];
+    const src1     = close[i - 1];
 
-    if (src > prev && src1 > prev)
-      newStop = Math.max(prev, src - nLoss[i]);
-    else if (src < prev && src1 < prev)
-      newStop = Math.min(prev, src + nLoss[i]);
+    if (src > prevStop && src1 > prevStop)
+      stop[i] = Math.max(prevStop, src - nLoss[i]);
+    else if (src < prevStop && src1 < prevStop)
+      stop[i] = Math.min(prevStop, src + nLoss[i]);
     else
-      newStop = src > prev ? src - nLoss[i] : src + nLoss[i];
-
-    stop.push(newStop);
-
-    if (src1 < prev && src > prev)       pos.push(1);
-    else if (src1 > prev && src < prev)  pos.push(-1);
-    else                                  pos.push(pos[i - 1]);
+      stop[i] = src > prevStop ? src - nLoss[i] : src + nLoss[i];
   }
 
-  // Use last valid ATR value
-  const lastAtr = atr[n - 1] || 0;
+  // ── Position (Pine Script crossover/crossunder logic) ──────────────────────
+  // pos = +1 when price crosses ABOVE stop (buy cross)
+  // pos = -1 when price crosses BELOW stop (sell cross)
+  // pos carries forward (nz(pos[1], 0)) until next cross
+  const pos = new Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const prevStop = stop[i - 1];
+    const src      = close[i];
+    const src1     = close[i - 1];
+
+    if (src1 < prevStop && src > prevStop)       pos[i] = 1;   // crossover  → BUY
+    else if (src1 > prevStop && src < prevStop)  pos[i] = -1;  // crossunder → SELL
+    else                                          pos[i] = pos[i - 1];
+  }
+
+  // ── Cross detection on the LAST candle ─────────────────────────────────────
+  // Pine: buy = crossover(src, xATRTrailingStop)  → fires only on the exact candle of cross
+  // We check last TWO candles to see if a cross just happened
+  const justBuy  = close[n-2] < stop[n-2] && close[n-1] > stop[n-1];  // crossover
+  const justSell = close[n-2] > stop[n-2] && close[n-1] < stop[n-1];  // crossunder
 
   return {
-    signal:   pos[n - 1],
-    stopLine: stop[n - 1],
-    atr:      lastAtr,
-    close:    close[n - 1]
+    pos:       pos[n - 1],      // current position state (+1/-1/0)
+    signal:    pos[n - 1],      // kept for compatibility
+    justBuy,                    // true only on the exact cross candle
+    justSell,                   // true only on the exact cross candle
+    stopLine:  stop[n - 1],
+    prevStop:  stop[n - 2],
+    atr:       atr[n - 1] || 0,
+    close:     close[n - 1],
+    prevClose: close[n - 2],
   };
 }
 
 async function getUTBotSignal() {
-  // Fetch 500 candles — gives ATR=300 plenty of warmup (Python uses 350, we use more for safety)
   const klines = await fetchKlines(500);
   if (!klines || klines.length < 10) {
-    console.error('[UT Bot] Failed to fetch klines');
+    console.error('[UT Bot] Failed to fetch klines from Binance');
     return { signal: 'No Data', price: 0, atr: 0, utbot_stop: 0,
              utbot1: null, utbot2: null, atr14: 0, atr1: 0, atr300: 0 };
   }
 
-  // Exact match to Python: calc_utbot(df.copy(), 2, 1) and calc_utbot(df.copy(), 2, 300)
-  const r1 = calcUTBot(klines, 2, 1);    // UT Bot #1: KV=2, ATR=1   → Sell Only
-  const r2 = calcUTBot(klines, 2, 300);  // UT Bot #2: KV=2, ATR=300 → Buy Only
+  // ── Your exact TradingView settings (from screenshot) ──────────────────────
+  // UT Bot #1: KV=2, ATR=1   → watches for SELL cross (Sell #1 checked in Style)
+  // UT Bot #2: KV=2, ATR=300 → watches for BUY cross  (Buy #2 checked in Style)
+  const r1 = calcUTBot(klines, 2, 1);    // KV=2, ATR=1   → Sell signals
+  const r2 = calcUTBot(klines, 2, 300);  // KV=2, ATR=300 → Buy signals
 
-  const price    = r1 ? r1.close : (r2 ? r2.close : 0);
-  let signal     = 'Hold';
-  let utbotStop  = price;
+  const price = r1 ? r1.close : (r2 ? r2.close : 0);
+  let signal    = 'Hold';
+  let utbotStop = price;
 
-  // Exact match to Python signal priority: Buy checked first, then Sell overrides
-  if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
-  if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+  // ── Pine Script crossover logic ─────────────────────────────────────────────
+  // BUY  = crossover(src, xATRTrailingStop2) → price just crossed ABOVE UT Bot #2 stop
+  // SELL = crossunder(src, xATRTrailingStop1) → price just crossed BELOW UT Bot #1 stop
+  // Using justBuy/justSell (cross event on last candle) — same as Pine plotshape triggers
+  if (r2 && r2.justBuy)   { signal = 'Buy';  utbotStop = r2.stopLine; }
+  if (r1 && r1.justSell)  { signal = 'Sell'; utbotStop = r1.stopLine; }
+
+  // Also track current position state for dashboard display
+  const pos1 = r1 ? r1.pos : 0;   // +1 = above stop, -1 = below stop
+  const pos2 = r2 ? r2.pos : 0;
 
   const atr14  = calcStableATR(klines, 14);
   const atr1   = r1 ? parseFloat(r1.atr.toFixed(2))  : 0;
   const atr300 = r2 ? parseFloat(r2.atr.toFixed(2))  : 0;
 
-  const sig1 = !r1 ? 'N/A' : r1.signal === -1 ? 'SELL' : r1.signal === 1 ? 'BUY' : 'HOLD';
-  const sig2 = !r2 ? 'N/A' : r2.signal ===  1 ? 'BUY'  : r2.signal === -1 ? 'SELL' : 'HOLD';
+  // Dashboard signal labels
+  const sig1state = pos1 ===  1 ? 'ABOVE STOP' : pos1 === -1 ? 'BELOW STOP' : 'HOLD';
+  const sig2state = pos2 ===  1 ? 'ABOVE STOP' : pos2 === -1 ? 'BELOW STOP' : 'HOLD';
 
-  // Matching Python print output
   console.log('='.repeat(60));
-  console.log(`BTCUSDT: $${price.toFixed(2)}`);
-  console.log(`ATR (14-period): $${atr14.toFixed(2)}`);
-  console.log('='.repeat(60));
-  if (r2 && r2.signal === 1)
-    console.log(`[BUY]  UT Bot #2 (KV=2, ATR=300): BUY signal | Stop: $${r2.stopLine.toFixed(2)}`);
-  else
-    console.log(`[    ] UT Bot #2 (KV=2, ATR=300): Hold`);
-  if (r1 && r1.signal === -1)
-    console.log(`[SELL] UT Bot #1 (KV=2, ATR=1):   SELL signal | Stop: $${r1.stopLine.toFixed(2)}`);
-  else
-    console.log(`[    ] UT Bot #1 (KV=2, ATR=1):   Hold`);
+  console.log(`BTCUSDT: $${price.toFixed(2)} | ATR14: $${atr14.toFixed(2)}`);
+  console.log(`UT Bot #1 (KV=2, ATR=1):   pos=${pos1} stop=$${r1?.stopLine?.toFixed(2)} | justSell=${r1?.justSell}`);
+  console.log(`UT Bot #2 (KV=2, ATR=300): pos=${pos2} stop=$${r2?.stopLine?.toFixed(2)} | justBuy=${r2?.justBuy}`);
   console.log(`Final Signal: ${signal}`);
   console.log('='.repeat(60));
 
   return {
-    signal,
-    price,
-    atr:        atr14,
-    utbot_stop: utbotStop,
+    signal, price, atr: atr14, utbot_stop: utbotStop,
     utbot1: {
       name:      'UT Bot #1',
       params:    'KV=2, ATR=1',
       role:      'Sell Signals',
-      signal:    sig1,
-      raw:       r1?.signal ?? 0,
+      signal:    r1?.justSell ? 'SELL' : sig1state,
+      just_cross: r1?.justSell || false,
+      pos:       pos1,
       stop_line: r1 ? parseFloat(r1.stopLine.toFixed(2)) : 0,
       atr:       atr1,
     },
@@ -286,8 +296,9 @@ async function getUTBotSignal() {
       name:      'UT Bot #2',
       params:    'KV=2, ATR=300',
       role:      'Buy Signals',
-      signal:    sig2,
-      raw:       r2?.signal ?? 0,
+      signal:    r2?.justBuy ? 'BUY' : sig2state,
+      just_cross: r2?.justBuy || false,
+      pos:       pos2,
       stop_line: r2 ? parseFloat(r2.stopLine.toFixed(2)) : 0,
       atr:       atr300,
     },
@@ -297,182 +308,7 @@ async function getUTBotSignal() {
   };
 }
 
-function calcStableATR(klines, period = 14) {
-  const tr = klines.map(k => parseFloat(k[2]) - parseFloat(k[3]));
-  const valid = tr.filter(v => v > 0);
-  if (valid.length < period) return valid.reduce((s, v) => s + v, 0) / (valid.length || 1);
-  return valid.slice(-period).reduce((s, v) => s + v, 0) / period;
-}
 
-// ─── Risk Management ──────────────────────────────────────────────────────────
-function calcPositionSize(balance, config, btcPrice = 84000) {
-  const { method, value, min_position_size, max_position_size } = config.position_sizing;
-  let size;
-  if (method === 'fixed') {
-    size = value;
-  } else if (method === 'percentage') {
-    // (balance * pct%) / (BTC price in INR)
-    const btcPriceINR = btcPrice * BTC_USDT_RATE;
-    size = (balance * (value / 100)) / btcPriceINR;
-  } else {
-    size = value;
-  }
-  return Math.max(min_position_size, Math.min(max_position_size, parseFloat(size.toFixed(6))));
-}
-
-function calcStopLoss(entryPrice, posType, atr, utbotStop, config) {
-  const sl = config.stop_loss;
-  if (!sl.enabled) return null;
-  if (posType === 'LONG') {
-    const slAtr   = entryPrice - (atr * sl.atr_multiplier);
-    const slFixed = entryPrice * (1 - sl.max_loss_percentage / 100);
-    if (sl.type === 'hybrid') {
-      const cand = Math.max(slAtr, slFixed);
-      return parseFloat((utbotStop ? Math.max(cand, utbotStop) : cand).toFixed(2));
-    }
-    if (sl.type === 'atr')     return parseFloat(slAtr.toFixed(2));
-    if (sl.type === 'utbot')   return parseFloat((utbotStop || slFixed).toFixed(2));
-    return parseFloat(slFixed.toFixed(2));
-  } else {
-    const slAtr   = entryPrice + (atr * sl.atr_multiplier);
-    const slFixed = entryPrice * (1 + sl.max_loss_percentage / 100);
-    if (sl.type === 'hybrid') {
-      const cand = Math.min(slAtr, slFixed);
-      return parseFloat((utbotStop ? Math.min(cand, utbotStop) : cand).toFixed(2));
-    }
-    if (sl.type === 'atr')     return parseFloat(slAtr.toFixed(2));
-    if (sl.type === 'utbot')   return parseFloat((utbotStop || slFixed).toFixed(2));
-    return parseFloat(slFixed.toFixed(2));
-  }
-}
-
-function calcTP(entryPrice, posType, atr, config) {
-  const tp  = config.take_profit;
-  if (!tp.enabled) return [];
-  const rules = config.different_rules_for_position_type;
-  const mults = rules.enabled
-    ? (posType === 'LONG' ? rules.long.tp_atr_multipliers : rules.short.tp_atr_multipliers)
-    : tp.levels.map(l => l.atr_multiplier);
-
-  return mults.map((mult, i) => {
-    const price = posType === 'LONG'
-      ? parseFloat((entryPrice + atr * mult).toFixed(2))
-      : parseFloat((entryPrice - atr * mult).toFixed(2));
-    const level = tp.levels[i] || { percentage: Math.floor(100 / mults.length), name: `TP${i + 1}` };
-    return { price, percentage: level.percentage, name: level.name, hit: false };
-  });
-}
-
-function calcLivePL(trade, price) {
-  if (!trade) return null;
-  const diff = trade.type === 'LONG'
-    ? (price - trade.entry_price) * trade.amount
-    : (trade.entry_price - price) * trade.amount;
-  return parseFloat((diff * BTC_USDT_RATE).toFixed(2));
-}
-
-async function canOpenTrade(balance) {
-  const config = await loadRiskConfig();
-  const state  = await loadRiskState();
-  const lim    = config.daily_limits;
-  if (lim.enabled) {
-    if (state.daily_loss >= lim.max_daily_loss)
-      return { allowed: false, reason: `Daily loss limit ₹${state.daily_loss.toFixed(2)} / ₹${lim.max_daily_loss}` };
-    if (state.daily_trades >= lim.max_daily_trades)
-      return { allowed: false, reason: `Daily trade limit ${state.daily_trades}/${lim.max_daily_trades}` };
-    if (state.consecutive_losses >= lim.max_consecutive_losses)
-      return { allowed: false, reason: `Max consecutive losses ${state.consecutive_losses}` };
-  }
-  const prot = config.account_protection;
-  if (prot.emergency_stop) return { allowed: false, reason: 'Emergency stop active' };
-  if (balance < prot.min_balance) return { allowed: false, reason: `Balance below minimum ₹${prot.min_balance}` };
-  if (state.peak_balance > 0) {
-    const dd = ((state.peak_balance - balance) / state.peak_balance) * 100;
-    if (dd >= prot.max_drawdown_percentage)
-      return { allowed: false, reason: `Max drawdown ${dd.toFixed(2)}%` };
-  }
-  return { allowed: true, reason: null };
-}
-
-async function recordTradeResult(profitLoss) {
-  const state = await loadRiskState();
-  state.daily_trades += 1;
-  if (profitLoss < 0) { state.daily_loss += Math.abs(profitLoss); state.consecutive_losses += 1; }
-  else                 { state.daily_profit += profitLoss;         state.consecutive_losses  = 0; }
-  await saveRiskState(state);
-}
-
-function closeFullPosition(data, trade, exitPrice, reason) {
-  const pnlUSDT = trade.type === 'LONG'
-    ? (exitPrice - trade.entry_price) * trade.amount
-    : (trade.entry_price - exitPrice) * trade.amount;
-  const pnlINR = parseFloat((pnlUSDT * BTC_USDT_RATE).toFixed(2));
-  const before = data.balance;
-  data.balance = parseFloat((data.balance + pnlINR).toFixed(2));
-  const rec = {
-    type:         trade.type,
-    entry_price:  trade.entry_price,
-    exit_price:   exitPrice,
-    amount:       trade.amount,
-    profit_usdt:  parseFloat(pnlUSDT.toFixed(4)),
-    profit_inr:   pnlINR,
-    balance_before: parseFloat(before.toFixed(2)),
-    balance_after:  data.balance,
-    closed_at:    new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-    opened_at:    trade.opened_at,
-    duration:     calcDuration(trade.opened_at),
-    exit_reason:  reason,
-    strategy:     trade.strategy,
-    atr_at_entry: trade.atr_at_entry,
-    rr_ratio:     calcRR(trade, exitPrice),
-    partial:      false
-  };
-  data.history.push(rec);
-  data.open_trade = null;
-  return rec;
-}
-
-function calcDuration(openedAt) {
-  try {
-    const open = new Date(openedAt.replace(/(\d{2})\/(\d{2})\/(\d{4}),/, '$3-$2-$1'));
-    const diff = Math.floor((Date.now() - open.getTime()) / 60000);
-    if (isNaN(diff)) return 'N/A';
-    if (diff < 60) return `${diff}m`;
-    return `${Math.floor(diff / 60)}h ${diff % 60}m`;
-  } catch { return 'N/A'; }
-}
-
-function calcRR(trade, exitPrice) {
-  if (!trade.stop_loss) return 'N/A';
-  const risk   = Math.abs(trade.entry_price - trade.stop_loss);
-  const reward = Math.abs(exitPrice - trade.entry_price);
-  if (risk === 0) return 'N/A';
-  return `1:${(reward / risk).toFixed(2)}`;
-}
-
-// ─── Trading Hours ────────────────────────────────────────────────────────────
-function getISTHour() {
-  const now   = new Date();
-  const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
-  const istMs = utcMs + (5.5 * 3600000);
-  return new Date(istMs).getHours();
-}
-
-function isTradingAllowed(state) {
-  // force_start overrides everything
-  if (state.force_start === true) return { allowed: true, reason: null };
-  // manual pause
-  if (state.manual_pause === true) return { allowed: false, reason: 'Manually paused' };
-  // hours disabled = 24/7
-  if (!state.enabled) return { allowed: true, reason: null };
-  // check IST hour window
-  const istHr = getISTHour();
-  const { start_hour, end_hour } = state;
-  if (istHr >= start_hour && istHr < end_hour) return { allowed: true, reason: null };
-  return { allowed: false, reason: `Outside trading hours (${start_hour}:00-${end_hour}:00 IST). Current IST: ${istHr}:00` };
-}
-
-// ─── Main Trade Update ────────────────────────────────────────────────────────
 async function updateDemoTrade(signal, price, atr, utbotStop) {
   signal = signal.charAt(0).toUpperCase() + signal.slice(1).toLowerCase();
   const data    = await loadTrades();

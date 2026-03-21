@@ -13,8 +13,8 @@ app.use(express.json());
 
 // ─── Upstash Redis Credentials ────────────────────────────────────────────────
 // Paste your Upstash credentials here directly:
-const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
-const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
+const REDIS_URL   = 'YOUR_UPSTASH_REDIS_REST_URL';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'YOUR_UPSTASH_REDIS_REST_TOKEN';  // e.g. AXxxxxxxxxxxxxxxxx
 
 async function redisCmd(...args) {
   const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
@@ -381,16 +381,25 @@ function calcRR(trade, exitPrice) {
 }
 
 // ─── Trading Hours ────────────────────────────────────────────────────────────
-function isTradingAllowed(state) {
-  if (state.force_start) return { allowed: true, reason: null };
-  if (state.manual_pause) return { allowed: false, reason: 'Manually paused' };
-  if (!state.enabled) return { allowed: true, reason: null };
-  // IST offset is UTC+5:30
+function getISTHour() {
   const now   = new Date();
-  const istHr = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+  const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+  const istMs = utcMs + (5.5 * 3600000);
+  return new Date(istMs).getHours();
+}
+
+function isTradingAllowed(state) {
+  // force_start overrides everything
+  if (state.force_start === true) return { allowed: true, reason: null };
+  // manual pause
+  if (state.manual_pause === true) return { allowed: false, reason: 'Manually paused' };
+  // hours disabled = 24/7
+  if (!state.enabled) return { allowed: true, reason: null };
+  // check IST hour window
+  const istHr = getISTHour();
   const { start_hour, end_hour } = state;
   if (istHr >= start_hour && istHr < end_hour) return { allowed: true, reason: null };
-  return { allowed: false, reason: `Outside trading hours (${start_hour}:00–${end_hour}:00 IST). Now: ${istHr}:00 IST` };
+  return { allowed: false, reason: `Outside trading hours (${start_hour}:00-${end_hour}:00 IST). Current IST: ${istHr}:00` };
 }
 
 // ─── Main Trade Update ────────────────────────────────────────────────────────
@@ -558,28 +567,40 @@ async function getRiskStatus() {
 // ── Cron-job.org ping: runs the bot logic
 app.get('/tick', async (req, res) => {
   try {
-    const tradingState          = await loadTradingState();
-    const { allowed, reason }   = isTradingAllowed(tradingState);
+    const tradingState        = await loadTradingState();
+    const { allowed, reason } = isTradingAllowed(tradingState);
+    const data                = await loadTrades();
+    const openTrade           = data.open_trade;
+
+    // ── SLEEP MODE: outside hours AND no open position ──────────────────────
+    // Do NOT hit Binance at all. Just ping-back so cron knows we are alive.
+    if (!allowed && !openTrade) {
+      console.log(`[tick] Sleeping — ${reason}`);
+      return res.json({ status: 'sleeping', reason, trading_allowed: false });
+    }
+
+    // ── We need price (either active trading OR open position needs SL/TP check)
     const { signal, price, atr, utbot_stop } = await getUTBotSignal();
 
     if (signal === 'No Data' || price === 0) {
-      return res.json({ status: 'error', message: 'Could not fetch price/signal' });
+      return res.json({ status: 'error', message: 'Could not fetch Binance price' });
     }
 
-    const data       = await loadTrades();
-    const openTrade  = data.open_trade;
     const livePL     = calcLivePL(openTrade, price);
     const riskStatus = await getRiskStatus();
 
+    // ── PAUSED but open position exists: only check SL/TP, no new trades ────
     if (!allowed) {
-      // Even when paused, still check SL/TP for open positions
-      if (openTrade) {
-        const slHit = openTrade.type === 'LONG' ? price <= openTrade.stop_loss : price >= openTrade.stop_loss;
-        const tpHit = openTrade.tp1_price && (openTrade.type === 'LONG' ? price >= openTrade.tp1_price : price <= openTrade.tp1_price);
-        if (slHit || tpHit) {
-          const result = await updateDemoTrade(signal, price, atr, utbot_stop);
-          return res.json({ status: 'sl_tp_checked', trading_allowed: false, pause_reason: reason, ...result });
-        }
+      const slHit = openTrade && (openTrade.type === 'LONG' ? price <= openTrade.stop_loss : price >= openTrade.stop_loss);
+      const tpHit = openTrade?.tp1_price && (openTrade.type === 'LONG' ? price >= openTrade.tp1_price : price <= openTrade.tp1_price);
+      if (slHit || tpHit) {
+        const result   = await updateDemoTrade(signal, price, atr, utbot_stop);
+        const reloaded = await loadTrades();
+        return res.json({
+          status: 'sl_tp_hit', trading_allowed: false, pause_reason: reason,
+          price, balance: reloaded.balance,
+          action: result.actionMsg, last_closed: result.lastClosed
+        });
       }
       return res.json({
         status: 'paused', trading_allowed: false, pause_reason: reason,
@@ -590,13 +611,15 @@ app.get('/tick', async (req, res) => {
       });
     }
 
-    const result = await updateDemoTrade(signal, price, atr, utbot_stop);
+    // ── ACTIVE TRADING ───────────────────────────────────────────────────────
+    console.log(`[tick] Trading ACTIVE | ${signal} @ $${price.toFixed(2)}`);
+    const result   = await updateDemoTrade(signal, price, atr, utbot_stop);
     const reloaded = await loadTrades();
 
     return res.json({
       status: 'ok', trading_allowed: true,
       price, signal,
-      balance:       result.data.balance,
+      balance:       reloaded.balance,
       holding:       !!reloaded.open_trade,
       position_type: reloaded.open_trade?.type || null,
       entry_price:   reloaded.open_trade?.entry_price || null,
@@ -610,10 +633,7 @@ app.get('/tick', async (req, res) => {
       risk_status:   riskStatus,
       last_closed:   result.lastClosed,
       force_start:   tradingState.force_start,
-      strategy_info: {
-        buy_strategy:  'UT Bot #2 (KV=2, ATR=300)',
-        sell_strategy: 'UT Bot #1 (KV=2, ATR=1)'
-      }
+      strategy_info: { buy_strategy: 'UT Bot #2 (KV=2, ATR=300)', sell_strategy: 'UT Bot #1 (KV=2, ATR=1)' }
     });
   } catch (err) {
     console.error('[/tick error]', err);
@@ -621,15 +641,16 @@ app.get('/tick', async (req, res) => {
   }
 });
 
-// ── Dashboard signal endpoint (same as tick but for UI polling)
+// ── Dashboard signal endpoint — always returns current state for UI
 app.get('/signal', async (req, res) => {
   try {
-    const tradingState          = await loadTradingState();
-    const { allowed, reason }   = isTradingAllowed(tradingState);
-    const data    = await loadTrades();
-    const openTrade = data.open_trade;
+    const tradingState        = await loadTradingState();
+    const { allowed, reason } = isTradingAllowed(tradingState);
+    const data                = await loadTrades();
+    const openTrade           = data.open_trade;
+    const istHr               = getISTHour();
 
-    // For dashboard, just get current price without running full bot logic
+    // Always fetch live price for the dashboard display
     let price = await fetchBTCPrice();
     if (!price) price = openTrade?.entry_price || 0;
 
@@ -656,6 +677,7 @@ app.get('/signal', async (req, res) => {
       last_signal:     data.last_signal,
       risk_status:     riskStatus,
       force_start:     tradingState.force_start,
+      ist_hour:        istHr,
       trading_hours:   { start: tradingState.start_hour, end: tradingState.end_hour }
     });
   } catch (err) {
@@ -799,8 +821,23 @@ app.post('/reset', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Debug time (check if IST hour is correct)
+app.get('/debug-time', async (req, res) => {
+  const ts    = await loadTradingState();
+  const istHr = getISTHour();
+  const { allowed, reason } = isTradingAllowed(ts);
+  res.json({
+    utc_time:      new Date().toUTCString(),
+    ist_hour:      istHr,
+    ist_time:      new Date(new Date().getTime() + (5.5*3600000)).toISOString(),
+    trading_state: ts,
+    trading_allowed: allowed,
+    reason
+  });
+});
+
 // ── Health check
-app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString(), ist_hour: getISTHour() }));
 app.get('/', (_, res) => res.send('UT Bot API running. Dashboard: use static index.html'));
 
 // ─── Start ────────────────────────────────────────────────────────────────────

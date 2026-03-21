@@ -212,20 +212,50 @@ async function getUTBotSignal() {
   const klines = await fetchKlines(350);
   if (!klines) return { signal: 'No Data', price: 0, atr: 0, utbot_stop: 0 };
 
-  const r1 = calcUTBot(klines, 2, 1);    // Sell signals
-  const r2 = calcUTBot(klines, 2, 300);  // Buy signals
+  const r1 = calcUTBot(klines, 2, 1);    // UT Bot #1 — KV=2, ATR=1   → Sell signals
+  const r2 = calcUTBot(klines, 2, 300);  // UT Bot #2 — KV=2, ATR=300 → Buy signals
 
   const price = r1 ? r1.close : 0;
-  let signal  = 'Hold';
+  let signal    = 'Hold';
   let utbotStop = price;
 
   if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
   if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
 
-  const atr14 = calcStableATR(klines, 14);
+  const atr14  = calcStableATR(klines, 14);
+  const atr1   = r1 ? parseFloat(r1.atr.toFixed(2))   : 0;
+  const atr300 = r2 ? parseFloat(r2.atr.toFixed(2))   : 0;
 
-  console.log(`[UT Bot] ${signal} @ $${price.toFixed(2)} | ATR: ${atr14.toFixed(2)}`);
-  return { signal, price, atr: atr14, utbot_stop: utbotStop };
+  const sig1 = r1 ? (r1.signal === -1 ? 'SELL' : r1.signal === 1 ? 'BUY' : 'HOLD') : 'N/A';
+  const sig2 = r2 ? (r2.signal ===  1 ? 'BUY'  : r2.signal === -1 ? 'SELL' : 'HOLD') : 'N/A';
+
+  console.log(`[UT Bot] ${signal} @ $${price.toFixed(2)} | ATR14: ${atr14.toFixed(2)} | #1(ATR1)=${sig1} stop=$${r1?.stopLine?.toFixed(0)} | #2(ATR300)=${sig2} stop=$${r2?.stopLine?.toFixed(0)}`);
+
+  return {
+    signal, price, atr: atr14, utbot_stop: utbotStop,
+    // Full UT Bot details for dashboard
+    utbot1: {
+      name:      'UT Bot #1',
+      params:    'KV=2, ATR=1',
+      role:      'Sell Signals',
+      signal:    sig1,
+      raw:       r1?.signal ?? 0,
+      stop_line: r1 ? parseFloat(r1.stopLine.toFixed(2)) : 0,
+      atr:       atr1,
+    },
+    utbot2: {
+      name:      'UT Bot #2',
+      params:    'KV=2, ATR=300',
+      role:      'Buy Signals',
+      signal:    sig2,
+      raw:       r2?.signal ?? 0,
+      stop_line: r2 ? parseFloat(r2.stopLine.toFixed(2)) : 0,
+      atr:       atr300,
+    },
+    atr14:  parseFloat(atr14.toFixed(2)),
+    atr1,
+    atr300,
+  };
 }
 
 function calcStableATR(klines, period = 14) {
@@ -641,7 +671,7 @@ app.get('/tick', async (req, res) => {
   }
 });
 
-// ── Dashboard signal endpoint — always returns current state for UI
+// ── Dashboard signal endpoint — runs full UT Bot calc and returns all signal details
 app.get('/signal', async (req, res) => {
   try {
     const tradingState        = await loadTradingState();
@@ -650,9 +680,9 @@ app.get('/signal', async (req, res) => {
     const openTrade           = data.open_trade;
     const istHr               = getISTHour();
 
-    // Always fetch live price for the dashboard display
-    let price = await fetchBTCPrice();
-    if (!price) price = openTrade?.entry_price || 0;
+    // Run full UT Bot signal calc (fetches Binance + calculates both instances)
+    const sigData = await getUTBotSignal();
+    const price   = sigData.price || openTrade?.entry_price || 0;
 
     const livePL     = calcLivePL(openTrade, price);
     const riskStatus = await getRiskStatus();
@@ -661,6 +691,14 @@ app.get('/signal', async (req, res) => {
       trading_allowed: allowed,
       pause_reason:    reason,
       price,
+      signal:          sigData.signal,
+      atr:             sigData.atr14,
+      atr14:           sigData.atr14,
+      atr1:            sigData.atr1,
+      atr300:          sigData.atr300,
+      utbot_stop:      sigData.utbot_stop,
+      utbot1:          sigData.utbot1,   // UT Bot #1 full details
+      utbot2:          sigData.utbot2,   // UT Bot #2 full details
       balance:         data.balance,
       holding:         !!openTrade,
       position_type:   openTrade?.type || null,

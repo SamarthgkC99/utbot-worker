@@ -1,514 +1,814 @@
 /**
- * Bot 1 — UT Bot Trading (BTCUSDT 5m)
- * State in memory. Saves to Upstash only on trade open/close.
- * Dashboard reads /state endpoint directly.
+ * UT Bot Trading System - Node.js Backend for Render
+ * Uses Upstash Redis for persistent state (shared across all devices/sessions)
+ * Triggered by cron-job.org every minute
  */
 
-const https = require('https');
-const http  = require('http');
+const express = require('express');
+const cors = require('cors');
 
-// ── Config ────────────────────────────────────────────────
-const PORT             = process.env.PORT || 3000;
-const START_BALANCE    = 10000;
-let BTC_USDT_RATE = 85; // updated hourly from live API
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// ── Fetch live USDT/INR rate (once per hour) ──────────────
-async function updateUSDTRate() {
-    try {
-        // ExchangeRate-API free tier — no key needed for basic pairs
-        const res = await fetchJSON('https://open.er-api.com/v6/latest/USD');
-        if (res && res.rates && res.rates.INR) {
-            BTC_USDT_RATE = parseFloat(res.rates.INR.toFixed(2));
-            console.log('💱 USDT/INR rate updated: ₹' + BTC_USDT_RATE);
-        }
-    } catch(e) {
-        console.warn('⚠️  Rate fetch failed, using last known: ₹' + BTC_USDT_RATE);
-    }
+// ─── Upstash Redis Credentials ────────────────────────────────────────────────
+// Paste your Upstash credentials here directly:
+const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
+
+async function redisCmd(...args) {
+  const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
+  const res  = await fetch(url, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+  });
+  const data = await res.json();
+  return data.result;
 }
-const LOOP_INTERVAL_MS = 5000;
-const CANDLE_LIMIT     = 350;
-const UPSTASH_URL      = 'https://robust-kitten-78595.upstash.io';
-const UPSTASH_TOKEN    = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';
-const REDIS_KEY        = 'bot1_state';
 
-// ── In-memory state ───────────────────────────────────────
-let _lastCandles = []; // stored for chart endpoint
+async function redisGet(key)        { return redisCmd('GET', key); }
+async function redisSet(key, value) { return redisCmd('SET', key, JSON.stringify(value)); }
 
-let state = {
-    balance:      START_BALANCE,
-    open_trade:   null,
-    history:      [],
-    order_log:    [],
-    last_signal:  'Hold',
-    last_atr:     0,
-    last_price:   0,
-    last_ut_stop: 0,
-    config: {
-        manual_pause: false,
-        force_start:  false,
-        risk: { max_daily_loss: 1000, max_trades: 20 }
-    },
-    daily_stats: { trades: 0, loss: 0, profit: 0, date: new Date().toDateString() }
+// ─── Constants ────────────────────────────────────────────────────────────────
+const START_BALANCE    = 10000;
+const BTC_USDT_RATE    = 85;        // 1 USDT = 85 INR (approximate, update as needed)
+const DEFAULT_TRADING_STATE = {
+  enabled:      true,
+  start_hour:   18,
+  end_hour:     23,
+  manual_pause: false,
+  force_start:  false
+};
+const DEFAULT_RISK_CONFIG = {
+  stop_loss: {
+    enabled:               true,
+    type:                  'hybrid',
+    atr_multiplier:        2.0,
+    max_loss_percentage:   3.0,
+    trailing_enabled:      true,
+    trailing_atr_multiplier: 1.5
+  },
+  take_profit: {
+    enabled: true,
+    type:    'scaled_atr',
+    levels: [
+      { percentage: 50, atr_multiplier: 2.5, name: 'TP1' },
+      { percentage: 30, atr_multiplier: 5.0, name: 'TP2' },
+      { percentage: 20, atr_multiplier: 7.5, name: 'TP3' }
+    ]
+  },
+  position_sizing: {
+    method:           'percentage',
+    value:            5.0,
+    min_position_size: 0.0001,
+    max_position_size: 0.01
+  },
+  daily_limits: {
+    enabled:               true,
+    max_daily_loss:        1000.0,
+    max_daily_trades:      20,
+    max_consecutive_losses: 5,
+    reset_hour:            0
+  },
+  account_protection: {
+    max_drawdown_percentage: 20.0,
+    min_balance:             5000.0,
+    emergency_stop:          false
+  },
+  different_rules_for_position_type: {
+    enabled: true,
+    long:    { tp_atr_multipliers: [3.0, 6.0, 9.0] },
+    short:   { tp_atr_multipliers: [2.0, 4.0, 6.0] }
+  }
 };
 
-// ── Upstash Redis (save/load) ─────────────────────────────
-async function saveState() {
+// ─── Redis State Helpers ──────────────────────────────────────────────────────
+async function loadTrades() {
+  const raw = await redisGet('trades');
+  if (!raw) return {
+    balance:    START_BALANCE,
+    open_trade: null,
+    history:    [],
+    order_log:  [],
+    last_signal: null
+  };
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+async function saveTrades(data) { await redisSet('trades', data); }
+
+async function loadTradingState() {
+  const raw = await redisGet('trading_state');
+  if (!raw) { await redisSet('trading_state', DEFAULT_TRADING_STATE); return DEFAULT_TRADING_STATE; }
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+async function saveTradingState(state) { await redisSet('trading_state', state); }
+
+async function loadRiskConfig() {
+  const raw = await redisGet('risk_config');
+  if (!raw) { await redisSet('risk_config', DEFAULT_RISK_CONFIG); return DEFAULT_RISK_CONFIG; }
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+async function saveRiskConfig(cfg) { await redisSet('risk_config', cfg); }
+
+async function loadRiskState() {
+  const raw = await redisGet('risk_state');
+  const defState = {
+    daily_loss: 0, daily_profit: 0, daily_trades: 0,
+    consecutive_losses: 0, last_reset: new Date().toISOString(), peak_balance: 0
+  };
+  if (!raw) { await redisSet('risk_state', defState); return defState; }
+  const state = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  // Reset if new day
+  const cfg = await loadRiskConfig();
+  const lastReset = new Date(state.last_reset);
+  const now = new Date();
+  const resetHour = cfg.daily_limits.reset_hour;
+  if (now.getDate() !== lastReset.getDate() ||
+      (now.getDate() === lastReset.getDate() && now.getHours() >= resetHour && lastReset.getHours() < resetHour)) {
+    const fresh = { ...defState, last_reset: now.toISOString() };
+    await redisSet('risk_state', fresh);
+    return fresh;
+  }
+  return state;
+}
+async function saveRiskState(state) { await redisSet('risk_state', state); }
+
+// ─── Binance Price Fetcher ────────────────────────────────────────────────────
+const BINANCE_ENDPOINTS = [
+  'https://api.binance.com',
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+  'https://api3.binance.com',
+  'https://data.binance.com'
+];
+
+async function binanceRequest(path, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  for (const base of BINANCE_ENDPOINTS) {
     try {
-        const encoded = encodeURIComponent(JSON.stringify(state));
-        await fetchJSON(UPSTASH_URL + '/set/' + REDIS_KEY + '/' + encoded, {
-            method: 'GET',
-            headers: { 'Authorization': 'Bearer ' + UPSTASH_TOKEN }
-        });
-        console.log('💾 State saved to Upstash');
-    } catch(e) { console.warn('⚠️  Upstash save error:', e.message); }
+      const res = await fetch(`${base}${path}?${qs}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+        signal:  AbortSignal.timeout(8000)
+      });
+      if (res.ok) return await res.json();
+    } catch (_) { /* try next */ }
+  }
+  return null;
 }
 
-async function loadState() {
-    try {
-        const res = await fetchJSON(UPSTASH_URL + '/get/' + REDIS_KEY, {
-            headers: { 'Authorization': 'Bearer ' + UPSTASH_TOKEN }
-        });
-        if (res && res.result) {
-            const saved = JSON.parse(res.result);
-            state = {
-                ...state, ...saved,
-                config: {
-                    ...state.config, ...(saved.config || {}),
-                    risk: { ...state.config.risk, ...(saved.config?.risk || {}) }
-                }
-            };
-            console.log('✅ State loaded from Upstash | Balance: ₹' + state.balance.toFixed(2));
-        } else {
-            console.log('📋 No saved state, starting fresh');
-        }
-    } catch(e) { console.warn('⚠️  Upstash load error:', e.message); }
+async function fetchBTCPrice() {
+  const data = await binanceRequest('/api/v3/ticker/price', { symbol: 'BTCUSDT' });
+  return data ? parseFloat(data.price) : null;
 }
 
-// ── HTTP Server ───────────────────────────────────────────
-http.createServer((req, res) => {
-    const url = req.url.split('?')[0];
-    const headers = {
-        'Access-Control-Allow-Origin':  '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
-    };
+async function fetchKlines(limit = 350) {
+  return binanceRequest('/api/v3/klines', { symbol: 'BTCUSDT', interval: '5m', limit });
+}
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204, headers); res.end(); return;
+// ─── UT Bot Logic ─────────────────────────────────────────────────────────────
+function calcUTBot(klines, keyvalue, atrPeriod) {
+  if (!klines || klines.length < atrPeriod + 5) return null;
+  const n = klines.length;
+  const close  = klines.map(k => parseFloat(k[4]));
+  const high   = klines.map(k => parseFloat(k[2]));
+  const low    = klines.map(k => parseFloat(k[3]));
+  const tr     = high.map((h, i) => h - low[i]);
+
+  // Rolling ATR (simple moving average)
+  const atr = new Array(n).fill(0);
+  for (let i = atrPeriod - 1; i < n; i++) {
+    atr[i] = tr.slice(i - atrPeriod + 1, i + 1).reduce((s, v) => s + v, 0) / atrPeriod;
+  }
+
+  const nLoss = atr.map(a => keyvalue * a);
+  const stop  = [close[0]];
+  const pos   = [0];
+
+  for (let i = 1; i < n; i++) {
+    const prev = stop[i - 1];
+    const src  = close[i];
+    const src1 = close[i - 1];
+    let newStop;
+    if (src > prev && src1 > prev)       newStop = Math.max(prev, src - nLoss[i]);
+    else if (src < prev && src1 < prev)  newStop = Math.min(prev, src + nLoss[i]);
+    else                                  newStop = src > prev ? src - nLoss[i] : src + nLoss[i];
+    stop.push(newStop);
+    if (src1 < prev && src > prev)       pos.push(1);
+    else if (src1 > prev && src < prev)  pos.push(-1);
+    else                                  pos.push(pos[i - 1]);
+  }
+
+  const stableAtr = atr.filter(v => v > 0);
+  const atrStable = stableAtr.length ? stableAtr[stableAtr.length - 1] : 0;
+
+  return {
+    signal:   pos[n - 1],
+    stopLine: stop[n - 1],
+    atr:      atrStable,
+    close:    close[n - 1]
+  };
+}
+
+async function getUTBotSignal() {
+  const klines = await fetchKlines(350);
+  if (!klines) return { signal: 'No Data', price: 0, atr: 0, utbot_stop: 0 };
+
+  const r1 = calcUTBot(klines, 2, 1);    // Sell signals
+  const r2 = calcUTBot(klines, 2, 300);  // Buy signals
+
+  const price = r1 ? r1.close : 0;
+  let signal  = 'Hold';
+  let utbotStop = price;
+
+  if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
+  if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+
+  const atr14 = calcStableATR(klines, 14);
+
+  console.log(`[UT Bot] ${signal} @ $${price.toFixed(2)} | ATR: ${atr14.toFixed(2)}`);
+  return { signal, price, atr: atr14, utbot_stop: utbotStop };
+}
+
+function calcStableATR(klines, period = 14) {
+  const tr = klines.map(k => parseFloat(k[2]) - parseFloat(k[3]));
+  const valid = tr.filter(v => v > 0);
+  if (valid.length < period) return valid.reduce((s, v) => s + v, 0) / (valid.length || 1);
+  return valid.slice(-period).reduce((s, v) => s + v, 0) / period;
+}
+
+// ─── Risk Management ──────────────────────────────────────────────────────────
+function calcPositionSize(balance, config) {
+  const { method, value, min_position_size, max_position_size } = config.position_sizing;
+  let size;
+  if (method === 'fixed') {
+    size = value;
+  } else if (method === 'percentage') {
+    const btcPriceINR = 97000 * BTC_USDT_RATE;
+    size = (balance * (value / 100)) / btcPriceINR;
+  } else {
+    size = value;
+  }
+  return Math.max(min_position_size, Math.min(max_position_size, parseFloat(size.toFixed(6))));
+}
+
+function calcStopLoss(entryPrice, posType, atr, utbotStop, config) {
+  const sl = config.stop_loss;
+  if (!sl.enabled) return null;
+  if (posType === 'LONG') {
+    const slAtr   = entryPrice - (atr * sl.atr_multiplier);
+    const slFixed = entryPrice * (1 - sl.max_loss_percentage / 100);
+    if (sl.type === 'hybrid') {
+      const cand = Math.max(slAtr, slFixed);
+      return parseFloat((utbotStop ? Math.max(cand, utbotStop) : cand).toFixed(2));
     }
-
-    // Full state for dashboard
-    if (url === '/state' && req.method === 'GET') {
-        res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(state));
-        return;
+    if (sl.type === 'atr')     return parseFloat(slAtr.toFixed(2));
+    if (sl.type === 'utbot')   return parseFloat((utbotStop || slFixed).toFixed(2));
+    return parseFloat(slFixed.toFixed(2));
+  } else {
+    const slAtr   = entryPrice + (atr * sl.atr_multiplier);
+    const slFixed = entryPrice * (1 + sl.max_loss_percentage / 100);
+    if (sl.type === 'hybrid') {
+      const cand = Math.min(slAtr, slFixed);
+      return parseFloat((utbotStop ? Math.min(cand, utbotStop) : cand).toFixed(2));
     }
-
-    // Chart data endpoint — pre-processed candles + indicators
-    if (url === '/chart-data' && req.method === 'GET') {
-        try {
-            const candles = _lastCandles;
-            if (!candles || candles.length === 0) {
-                res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ candles: [], stop_line: [], signals: [], utbot_pos: [] }));
-                return;
-            }
-            // Last 150 candles for chart
-            const slice   = candles.slice(-150);
-            const closes  = slice.map(c => c.close);
-            const highs   = slice.map(c => c.high);
-            const lows    = slice.map(c => c.low);
-
-            // UT Bot stop line
-            const utBot2  = calcUTBot(slice, 2, 300);
-            const utBot1  = calcUTBot(slice, 2, 1);
-
-            const stopLine = utBot2.stop.map((v, i) => ({
-                time:  Math.floor(slice[i].time / 1000),
-                value: parseFloat(v.toFixed(2))
-            }));
-
-            // Signals
-            const signals = [];
-            for (let i = 1; i < utBot2.pos.length; i++) {
-                if (utBot2.pos[i] === 1 && utBot2.pos[i-1] !== 1) {
-                    signals.push({ type: 'buy',  time: Math.floor(slice[i].time/1000), price: slice[i].close });
-                }
-                if (utBot1.pos[i] === -1 && utBot1.pos[i-1] !== -1) {
-                    signals.push({ type: 'sell', time: Math.floor(slice[i].time/1000), price: slice[i].close });
-                }
-            }
-
-            const chartCandles = slice.map(c => ({
-                time:   Math.floor(c.time / 1000),
-                open:   c.open,
-                high:   c.high,
-                low:    c.low,
-                close:  c.close,
-                volume: c.volume
-            }));
-
-            res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-            
-            // ✅ FIXED: Added utbot_pos so frontend can color the line Green/Red
-            res.end(JSON.stringify({ 
-                candles: chartCandles, 
-                stop_line: stopLine, 
-                signals,
-                utbot_pos: utBot2.pos 
-            }));
-        } catch(e) {
-            res.writeHead(500, headers);
-            res.end(JSON.stringify({ error: e.message }));
-        }
-        return;
-    }
-
-    // Control commands from dashboard buttons
-    if (url === '/config' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', async () => {
-            try {
-                const cmd = JSON.parse(body);
-                if (cmd.manual_pause !== undefined) state.config.manual_pause = cmd.manual_pause;
-                if (cmd.force_start  !== undefined) state.config.force_start  = cmd.force_start;
-                if (cmd.clear_history) {
-                    state.history = [];
-                    state.daily_stats.trades = 0;
-                    state.daily_stats.loss   = 0;
-                    state.daily_stats.profit = 0;
-                    await saveState();
-                }
-                if (cmd.force_close && state.open_trade) {
-                    const price = state.last_price;
-                    const trade = state.open_trade;
-                    const usdtPL = trade.type === 'LONG'
-                        ? (price - trade.entry_price) * trade.amount
-                        : (trade.entry_price - price) * trade.amount;
-                    const inrPL = usdtPL * BTC_USDT_RATE;
-                    state.balance += inrPL;
-                    state.history.push({
-                        type: trade.type, entry_price: trade.entry_price,
-                        exit_price: price, profit_inr: inrPL,
-                        exit_reason: 'Force Stop', amount: trade.amount,
-                        rr_mode: '1:1', opened_at: trade.opened_at, time: Date.now()
-                    });
-                    state.daily_stats.trades++;
-                    if (inrPL < 0) state.daily_stats.loss   += Math.abs(inrPL);
-                    else           state.daily_stats.profit += inrPL;
-                    state.open_trade = null;
-                    state.config.manual_pause = true;
-                    await saveState();
-                }
-                await saveState();
-                res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true }));
-            } catch(e) {
-                res.writeHead(400, headers);
-                res.end(JSON.stringify({ error: e.message }));
-            }
-        });
-        return;
-    }
-
-    // Ping for cron-job.org
-    if (url === '/ping' || url === '/') {
-        res.writeHead(200, { ...headers, 'Content-Type': 'text/plain' });
-        res.end('OK');
-        return;
-    }
-
-    // Health check
-    if (url === '/health') {
-        const wins    = state.history.filter(t => t.profit_inr > 0).length;
-        const totalPL = state.history.reduce((a, b) => a + b.profit_inr, 0);
-        res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            status:       'running ✅',
-            balance_inr:  '₹' + state.balance.toFixed(2),
-            open_trade:   state.open_trade ? state.open_trade.type + ' @ $' + state.open_trade.entry_price.toFixed(2) : 'none',
-            trades_today: state.daily_stats.trades,
-            win_rate:     state.history.length ? Math.round(wins / state.history.length * 100) + '%' : '0%',
-            total_pl:     '₹' + totalPL.toFixed(2),
-            signal:       state.last_signal,
-            time_ist:     new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-        }));
-        return;
-    }
-
-    res.writeHead(404, headers); res.end('Not found');
-
-}).listen(PORT, () => console.log('🌐 Server on port ' + PORT));
-
-// ── HTTP Fetch ────────────────────────────────────────────
-function fetchJSON(url, options, redirectCount) {
-    options       = options       || {};
-    redirectCount = redirectCount || 0;
-    return new Promise((resolve, reject) => {
-        if (redirectCount > 5) return reject(new Error('Too many redirects'));
-        const urlObj = new URL(url);
-        const req = https.request({
-            hostname: urlObj.hostname,
-            path:     urlObj.pathname + urlObj.search,
-            method:   options.method || 'GET',
-            headers:  options.headers || {}
-        }, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
-                return fetchJSON(res.headers.location, options, redirectCount + 1).then(resolve).catch(reject);
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    if (res.statusCode >= 400) reject(new Error('HTTP ' + res.statusCode + ': ' + data.slice(0, 200)));
-                    else resolve(parsed);
-                } catch(e) { reject(new Error('JSON parse: ' + data.slice(0, 100))); }
-            });
-        });
-        req.on('error', reject);
-        if (options.body) req.write(options.body);
-        req.end();
-    });
+    if (sl.type === 'atr')     return parseFloat(slAtr.toFixed(2));
+    if (sl.type === 'utbot')   return parseFloat((utbotStop || slFixed).toFixed(2));
+    return parseFloat(slFixed.toFixed(2));
+  }
 }
 
-// ── Fetch Candles ─────────────────────────────────────────
-async function fetchCandles(interval, limit) {
-    const endpoints = [
-        `https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`,
-        `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`,
-        `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`
-    ];
-    for (const url of endpoints) {
-        try {
-            const data = await fetchJSON(url);
-            if (!Array.isArray(data)) continue;
-            console.log(`✅ Candles fetched (${data.length})`);
-            return data.map(d => ({
-                time: d[0], open: parseFloat(d[1]), high: parseFloat(d[2]),
-                low: parseFloat(d[3]), close: parseFloat(d[4]), volume: parseFloat(d[5])
-            }));
-        } catch(e) { console.warn('⚠️  Candle fetch failed:', e.message); }
-    }
-    return null;
+function calcTP(entryPrice, posType, atr, config) {
+  const tp  = config.take_profit;
+  if (!tp.enabled) return [];
+  const rules = config.different_rules_for_position_type;
+  const mults = rules.enabled
+    ? (posType === 'LONG' ? rules.long.tp_atr_multipliers : rules.short.tp_atr_multipliers)
+    : tp.levels.map(l => l.atr_multiplier);
+
+  return mults.map((mult, i) => {
+    const price = posType === 'LONG'
+      ? parseFloat((entryPrice + atr * mult).toFixed(2))
+      : parseFloat((entryPrice - atr * mult).toFixed(2));
+    const level = tp.levels[i] || { percentage: Math.floor(100 / mults.length), name: `TP${i + 1}` };
+    return { price, percentage: level.percentage, name: level.name, hit: false };
+  });
 }
 
-// ── Indicators ────────────────────────────────────────────
-function calcATR(candles, period) {
-    period = period || 14;
-    const trues = candles.map((c, i) => i === 0 ? c.high - c.low :
-        Math.max(c.high - c.low, Math.abs(c.high - candles[i-1].close), Math.abs(c.low - candles[i-1].close)));
-    return trues.map((_, i) => {
-        if (i < period - 1) return null;
-        let sum = 0; for (let j = i - period + 1; j <= i; j++) sum += trues[j];
-        return sum / period;
-    });
+function calcLivePL(trade, price) {
+  if (!trade) return null;
+  const diff = trade.type === 'LONG'
+    ? (price - trade.entry_price) * trade.amount
+    : (trade.entry_price - price) * trade.amount;
+  return parseFloat((diff * BTC_USDT_RATE).toFixed(2));
 }
 
-function calcUTBot(candles, keyValue, atrPeriod) {
-    const closes = candles.map(c => c.close);
-    const atrs   = calcATR(candles, atrPeriod);
-    const nLoss  = atrs.map(a => a ? a * keyValue : 0);
-    const stop   = [closes[0]], pos = [0];
-    for (let i = 1; i < closes.length; i++) {
-        const prev = stop[i-1], src = closes[i], src1 = closes[i-1];
-        let ns;
-        if      (src > prev && src1 > prev) ns = Math.max(prev, src - nLoss[i]);
-        else if (src < prev && src1 < prev) ns = Math.min(prev, src + nLoss[i]);
-        else ns = src > prev ? src - nLoss[i] : src + nLoss[i];
-        stop.push(ns);
-        let p;
-        if      (src1 < prev && src > prev) p =  1;
-        else if (src1 > prev && src < prev) p = -1;
-        else p = pos[i-1];
-        pos.push(p);
-    }
-    return { stop, pos };
+async function canOpenTrade(balance) {
+  const config = await loadRiskConfig();
+  const state  = await loadRiskState();
+  const lim    = config.daily_limits;
+  if (lim.enabled) {
+    if (state.daily_loss >= lim.max_daily_loss)
+      return { allowed: false, reason: `Daily loss limit ₹${state.daily_loss.toFixed(2)} / ₹${lim.max_daily_loss}` };
+    if (state.daily_trades >= lim.max_daily_trades)
+      return { allowed: false, reason: `Daily trade limit ${state.daily_trades}/${lim.max_daily_trades}` };
+    if (state.consecutive_losses >= lim.max_consecutive_losses)
+      return { allowed: false, reason: `Max consecutive losses ${state.consecutive_losses}` };
+  }
+  const prot = config.account_protection;
+  if (prot.emergency_stop) return { allowed: false, reason: 'Emergency stop active' };
+  if (balance < prot.min_balance) return { allowed: false, reason: `Balance below minimum ₹${prot.min_balance}` };
+  if (state.peak_balance > 0) {
+    const dd = ((state.peak_balance - balance) / state.peak_balance) * 100;
+    if (dd >= prot.max_drawdown_percentage)
+      return { allowed: false, reason: `Max drawdown ${dd.toFixed(2)}%` };
+  }
+  return { allowed: true, reason: null };
 }
 
-// ── Signal Processing ─────────────────────────────────────
-function processSignal(candles) {
-    const closes = candles.map(c => c.close);
-    const n      = closes.length;
-
-    const utBot2 = calcUTBot(candles, 2, 300);
-    const utBot1 = calcUTBot(candles, 2, 1);
-
-    // Signal only on CROSSOVER (position change), not every bar
-    const buySignal  = utBot2.pos[n-1] ===  1 && utBot2.pos[n-2] !== 1;
-    const sellSignal = utBot1.pos[n-1] === -1 && utBot1.pos[n-2] !== -1;
-
-    let signal = 'Hold';
-    if (buySignal)  signal = 'Buy';
-    if (sellSignal) signal = 'Sell';
-
-    const atr14 = calcATR(candles, 14);
-    const atr   = atr14[n-1] || 0;
-    const stop  = utBot2.pos[n-1] === 1 ? utBot2.stop[n-1] : utBot1.stop[n-1];
-
-    return { price: closes[n-1], signal, atr, stop, utBot2, utBot1 };
+async function recordTradeResult(profitLoss) {
+  const state = await loadRiskState();
+  state.daily_trades += 1;
+  if (profitLoss < 0) { state.daily_loss += Math.abs(profitLoss); state.consecutive_losses += 1; }
+  else                 { state.daily_profit += profitLoss;         state.consecutive_losses  = 0; }
+  await saveRiskState(state);
 }
 
-// ── Trading Logic ─────────────────────────────────────────
-function isTradingAllowed() {
-    if (state.config.force_start)  return { allowed: true };
-    if (state.config.manual_pause) return { allowed: false, reason: 'Manually Paused' };
-    return { allowed: true };
+function closeFullPosition(data, trade, exitPrice, reason) {
+  const pnlUSDT = trade.type === 'LONG'
+    ? (exitPrice - trade.entry_price) * trade.amount
+    : (trade.entry_price - exitPrice) * trade.amount;
+  const pnlINR = parseFloat((pnlUSDT * BTC_USDT_RATE).toFixed(2));
+  const before = data.balance;
+  data.balance = parseFloat((data.balance + pnlINR).toFixed(2));
+  const rec = {
+    type:         trade.type,
+    entry_price:  trade.entry_price,
+    exit_price:   exitPrice,
+    amount:       trade.amount,
+    profit_usdt:  parseFloat(pnlUSDT.toFixed(4)),
+    profit_inr:   pnlINR,
+    balance_before: parseFloat(before.toFixed(2)),
+    balance_after:  data.balance,
+    closed_at:    new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    opened_at:    trade.opened_at,
+    duration:     calcDuration(trade.opened_at),
+    exit_reason:  reason,
+    strategy:     trade.strategy,
+    atr_at_entry: trade.atr_at_entry,
+    rr_ratio:     calcRR(trade, exitPrice),
+    partial:      false
+  };
+  data.history.push(rec);
+  data.open_trade = null;
+  return rec;
 }
 
-function calcLotSize(balance, atr, price, prevAtr) {
-    // ATR expanding = strong momentum = 2% risk, else 1% risk
-    const riskPct    = (prevAtr && atr > prevAtr) ? 0.02 : 0.01;
-    const riskINR    = balance * riskPct;
-    const slDistUSDT = atr * 1.5;                          // SL distance in USDT
-    const slDistINR  = slDistUSDT * BTC_USDT_RATE;        // SL distance in INR
-    if (slDistINR <= 0) return 0.001;
-    const rawLot = riskINR / slDistINR;                    // lot in BTC
-    const lot    = Math.max(0.0001, Math.min(0.002, parseFloat(rawLot.toFixed(4))));
-    console.log(`📐 Lot size: ${lot} BTC | Risk: ${riskPct*100}% (${riskINR.toFixed(2)} INR) | ATR expanding: ${prevAtr && atr > prevAtr}`);
-    return lot;
+function calcDuration(openedAt) {
+  try {
+    const open = new Date(openedAt.replace(/(\d{2})\/(\d{2})\/(\d{4}),/, '$3-$2-$1'));
+    const diff = Math.floor((Date.now() - open.getTime()) / 60000);
+    if (isNaN(diff)) return 'N/A';
+    if (diff < 60) return `${diff}m`;
+    return `${Math.floor(diff / 60)}h ${diff % 60}m`;
+  } catch { return 'N/A'; }
 }
 
-function openTrade(signal, price, atr, utbotStop, prevAtr) {
-    let sl, tp;
-    if (signal === 'Buy') {
-        sl = Math.max(price - 2 * atr, utbotStop);
-        tp = price + 3 * atr;
+function calcRR(trade, exitPrice) {
+  if (!trade.stop_loss) return 'N/A';
+  const risk   = Math.abs(trade.entry_price - trade.stop_loss);
+  const reward = Math.abs(exitPrice - trade.entry_price);
+  if (risk === 0) return 'N/A';
+  return `1:${(reward / risk).toFixed(2)}`;
+}
+
+// ─── Trading Hours ────────────────────────────────────────────────────────────
+function isTradingAllowed(state) {
+  if (state.force_start) return { allowed: true, reason: null };
+  if (state.manual_pause) return { allowed: false, reason: 'Manually paused' };
+  if (!state.enabled) return { allowed: true, reason: null };
+  // IST offset is UTC+5:30
+  const now   = new Date();
+  const istHr = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+  const { start_hour, end_hour } = state;
+  if (istHr >= start_hour && istHr < end_hour) return { allowed: true, reason: null };
+  return { allowed: false, reason: `Outside trading hours (${start_hour}:00–${end_hour}:00 IST). Now: ${istHr}:00 IST` };
+}
+
+// ─── Main Trade Update ────────────────────────────────────────────────────────
+async function updateDemoTrade(signal, price, atr, utbotStop) {
+  signal = signal.charAt(0).toUpperCase() + signal.slice(1).toLowerCase();
+  const data    = await loadTrades();
+  const config  = await loadRiskConfig();
+  let openTrade = data.open_trade;
+  let actionMsg = '';
+  let lastClosed = null;
+
+  const ts = () => new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const logEntry = { time: ts(), side: signal, price, quantity: calcPositionSize(data.balance, config) };
+
+  // ── Check open trade for SL / TP hits ──
+  if (openTrade) {
+    const { type, stop_loss, tp1_price } = openTrade;
+    const slHit = type === 'LONG' ? price <= stop_loss : price >= stop_loss;
+    const tpHit = tp1_price && (type === 'LONG' ? price >= tp1_price : price <= tp1_price);
+
+    if (slHit && stop_loss) {
+      lastClosed = closeFullPosition(data, openTrade, price, 'Stop-Loss Hit');
+      await recordTradeResult(lastClosed.profit_inr);
+      actionMsg = `🛑 STOP-LOSS @ $${price.toFixed(2)} | P/L: ₹${lastClosed.profit_inr}`;
+      logEntry.action = 'STOP_LOSS'; logEntry.pl_inr = lastClosed.profit_inr;
+      openTrade = null;
+    } else if (tpHit) {
+      lastClosed = closeFullPosition(data, openTrade, price, 'TP1 Hit - Full Exit');
+      await recordTradeResult(lastClosed.profit_inr);
+      actionMsg = `✅ TP1 HIT @ $${price.toFixed(2)} | P/L: ₹${lastClosed.profit_inr}`;
+      logEntry.action = 'TP1_FULL_EXIT'; logEntry.pl_inr = lastClosed.profit_inr;
+      openTrade = null;
     } else {
-        sl = Math.min(price + 2 * atr, utbotStop);
-        tp = price - 2 * atr;
+      // Trailing stop
+      if (openTrade.breakeven_moved && config.stop_loss.trailing_enabled) {
+        const dist = atr * config.stop_loss.trailing_atr_multiplier;
+        const newSL = openTrade.type === 'LONG' ? price - dist : price + dist;
+        const improved = openTrade.type === 'LONG' ? newSL > openTrade.stop_loss : newSL < openTrade.stop_loss;
+        if (improved) {
+          openTrade.stop_loss = parseFloat(newSL.toFixed(2));
+          actionMsg = `📈 Trailing SL → $${openTrade.stop_loss}`;
+          logEntry.action = 'TRAILING_STOP_UPDATE';
+        }
+      }
     }
-    const amount = calcLotSize(state.balance, atr, price, prevAtr);
-    state.open_trade = {
-        type:        signal === 'Buy' ? 'LONG' : 'SHORT',
-        entry_price: price,
-        amount:      amount,
-        stop_loss:   sl,
-        tp1:         tp,
-        rr_mode:     '1:1',
-        opened_at:   Date.now()
-    };
-    console.log(`📈 Opened ${state.open_trade.type} @ $${price.toFixed(2)} | SL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)} | Lot: ${amount} BTC`);
+  }
+
+  if (signal === 'Hold') {
+    if (!actionMsg) { actionMsg = 'Holding position'; logEntry.action = 'HOLD'; }
+  } else if (signal === 'Buy') {
+    const check = await canOpenTrade(data.balance);
+    if (!check.allowed) {
+      actionMsg = `⚠️ Blocked: ${check.reason}`;
+      logEntry.action = 'BLOCKED';
+    } else if (openTrade && openTrade.type === 'LONG') {
+      actionMsg = 'Already LONG'; logEntry.action = 'IGNORED';
+    } else {
+      if (openTrade && openTrade.type === 'SHORT') {
+        lastClosed = closeFullPosition(data, openTrade, price, 'Opposite Signal');
+        await recordTradeResult(lastClosed.profit_inr);
+        actionMsg += `CLOSED SHORT @ $${price.toFixed(2)}, P/L: ₹${lastClosed.profit_inr} | `;
+        logEntry.action = 'CLOSE_SHORT'; logEntry.pl_inr = lastClosed.profit_inr;
+        openTrade = null;
+      }
+      const size  = calcPositionSize(data.balance, config);
+      const sl    = calcStopLoss(price, 'LONG', atr, utbotStop, config);
+      const tpArr = calcTP(price, 'LONG', atr, config);
+      const tp1   = tpArr[0]?.price || null;
+      openTrade = {
+        type:            'LONG',
+        entry_price:     price,
+        amount:          size,
+        original_amount: size,
+        stop_loss:       sl,
+        tp1_price:       tp1,
+        tp_levels:       tpArr.slice(0, 1),
+        opened_at:       ts(),
+        strategy:        'UT Bot #2 (KV=2, ATR=300)',
+        atr_at_entry:    atr,
+        breakeven_moved: false,
+        entry_reason:    'UT Bot ATR=300 pos=1 (Buy Signal)'
+      };
+      actionMsg += `🟢 LONG @ $${price.toFixed(2)} | Size: ${size} BTC | SL: $${sl} | TP1: $${tp1}`;
+      logEntry.action = 'OPEN_LONG'; logEntry.stop_loss = sl; logEntry.tp1 = tp1;
+      data.last_signal = 'Buy';
+    }
+  } else if (signal === 'Sell') {
+    const check = await canOpenTrade(data.balance);
+    if (!check.allowed) {
+      actionMsg = `⚠️ Blocked: ${check.reason}`;
+      logEntry.action = 'BLOCKED';
+    } else if (openTrade && openTrade.type === 'SHORT') {
+      actionMsg = 'Already SHORT'; logEntry.action = 'IGNORED';
+    } else {
+      if (openTrade && openTrade.type === 'LONG') {
+        lastClosed = closeFullPosition(data, openTrade, price, 'Opposite Signal');
+        await recordTradeResult(lastClosed.profit_inr);
+        actionMsg += `CLOSED LONG @ $${price.toFixed(2)}, P/L: ₹${lastClosed.profit_inr} | `;
+        logEntry.action = 'CLOSE_LONG'; logEntry.pl_inr = lastClosed.profit_inr;
+        openTrade = null;
+      }
+      const size  = calcPositionSize(data.balance, config);
+      const sl    = calcStopLoss(price, 'SHORT', atr, utbotStop, config);
+      const tpArr = calcTP(price, 'SHORT', atr, config);
+      const tp1   = tpArr[0]?.price || null;
+      openTrade = {
+        type:            'SHORT',
+        entry_price:     price,
+        amount:          size,
+        original_amount: size,
+        stop_loss:       sl,
+        tp1_price:       tp1,
+        tp_levels:       tpArr.slice(0, 1),
+        opened_at:       ts(),
+        strategy:        'UT Bot #1 (KV=2, ATR=1)',
+        atr_at_entry:    atr,
+        breakeven_moved: false,
+        entry_reason:    'UT Bot ATR=1 pos=-1 (Sell Signal)'
+      };
+      actionMsg += `🔴 SHORT @ $${price.toFixed(2)} | Size: ${size} BTC | SL: $${sl} | TP1: $${tp1}`;
+      logEntry.action = 'OPEN_SHORT'; logEntry.stop_loss = sl; logEntry.tp1 = tp1;
+      data.last_signal = 'Sell';
+    }
+  }
+
+  data.open_trade = openTrade;
+  if (!data.order_log) data.order_log = [];
+  data.order_log.push(logEntry);
+  // Keep only last 500 log entries in Redis to avoid size issues
+  if (data.order_log.length > 500) data.order_log = data.order_log.slice(-500);
+  await saveTrades(data);
+
+  // Update peak balance
+  const riskState = await loadRiskState();
+  if (data.balance > (riskState.peak_balance || 0)) {
+    riskState.peak_balance = data.balance;
+    await saveRiskState(riskState);
+  }
+
+  return { data, openTrade, lastClosed, logEntry, actionMsg };
 }
 
-function closeTrade(price, reason) {
-    const trade = state.open_trade;
-    if (!trade) return;
-    const usdtPL = trade.type === 'LONG'
-        ? (price - trade.entry_price) * trade.amount
-        : (trade.entry_price - price) * trade.amount;
-    const inrPL = usdtPL * BTC_USDT_RATE;
-    state.balance += inrPL;
-    state.history.push({
-        type:        trade.type,
-        entry_price: trade.entry_price,
-        exit_price:  price,
-        profit_inr:  inrPL,
-        exit_reason: reason,
-        amount:      trade.amount,
-        rr_mode:     trade.rr_mode || '1:1',
-        opened_at:   trade.opened_at,
-        time:        Date.now()
+// ─── Risk Status Helper ───────────────────────────────────────────────────────
+async function getRiskStatus() {
+  const config = await loadRiskConfig();
+  const state  = await loadRiskState();
+  const lim    = config.daily_limits;
+  return {
+    daily_stats: {
+      trades:             `${state.daily_trades}/${lim.max_daily_trades}`,
+      loss:               `₹${(state.daily_loss || 0).toFixed(2)}/₹${lim.max_daily_loss}`,
+      profit:             `₹${(state.daily_profit || 0).toFixed(2)}`,
+      consecutive_losses: `${state.consecutive_losses}/${lim.max_consecutive_losses}`
+    },
+    limits_usage: {
+      trades_pct: lim.max_daily_trades ? (state.daily_trades / lim.max_daily_trades) * 100 : 0,
+      loss_pct:   lim.max_daily_loss   ? ((state.daily_loss || 0) / lim.max_daily_loss) * 100 : 0
+    },
+    config
+  };
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+// ── Cron-job.org ping: runs the bot logic
+app.get('/tick', async (req, res) => {
+  try {
+    const tradingState          = await loadTradingState();
+    const { allowed, reason }   = isTradingAllowed(tradingState);
+    const { signal, price, atr, utbot_stop } = await getUTBotSignal();
+
+    if (signal === 'No Data' || price === 0) {
+      return res.json({ status: 'error', message: 'Could not fetch price/signal' });
+    }
+
+    const data       = await loadTrades();
+    const openTrade  = data.open_trade;
+    const livePL     = calcLivePL(openTrade, price);
+    const riskStatus = await getRiskStatus();
+
+    if (!allowed) {
+      // Even when paused, still check SL/TP for open positions
+      if (openTrade) {
+        const slHit = openTrade.type === 'LONG' ? price <= openTrade.stop_loss : price >= openTrade.stop_loss;
+        const tpHit = openTrade.tp1_price && (openTrade.type === 'LONG' ? price >= openTrade.tp1_price : price <= openTrade.tp1_price);
+        if (slHit || tpHit) {
+          const result = await updateDemoTrade(signal, price, atr, utbot_stop);
+          return res.json({ status: 'sl_tp_checked', trading_allowed: false, pause_reason: reason, ...result });
+        }
+      }
+      return res.json({
+        status: 'paused', trading_allowed: false, pause_reason: reason,
+        price, signal: 'Hold', balance: data.balance,
+        holding: !!openTrade, live_pl_inr: livePL,
+        entry_price: openTrade?.entry_price, stop_loss: openTrade?.stop_loss,
+        position_type: openTrade?.type, risk_status: riskStatus
+      });
+    }
+
+    const result = await updateDemoTrade(signal, price, atr, utbot_stop);
+    const reloaded = await loadTrades();
+
+    return res.json({
+      status: 'ok', trading_allowed: true,
+      price, signal,
+      balance:       result.data.balance,
+      holding:       !!reloaded.open_trade,
+      position_type: reloaded.open_trade?.type || null,
+      entry_price:   reloaded.open_trade?.entry_price || null,
+      stop_loss:     reloaded.open_trade?.stop_loss || null,
+      tp1_price:     reloaded.open_trade?.tp1_price || null,
+      tp_levels:     reloaded.open_trade?.tp_levels || [],
+      position_size: reloaded.open_trade?.amount || 0,
+      action:        result.actionMsg,
+      live_pl_inr:   calcLivePL(reloaded.open_trade, price),
+      atr,
+      risk_status:   riskStatus,
+      last_closed:   result.lastClosed,
+      force_start:   tradingState.force_start,
+      strategy_info: {
+        buy_strategy:  'UT Bot #2 (KV=2, ATR=300)',
+        sell_strategy: 'UT Bot #1 (KV=2, ATR=1)'
+      }
     });
-    state.daily_stats.trades++;
-    if (inrPL < 0) state.daily_stats.loss   += Math.abs(inrPL);
-    else           state.daily_stats.profit += inrPL;
-    state.open_trade = null;
-    const emoji = inrPL >= 0 ? '✅' : '🛑';
-    console.log(`${emoji} Closed ${trade.type} @ $${price.toFixed(2)} | P/L: ₹${inrPL.toFixed(2)} | ${reason}`);
-}
+  } catch (err) {
+    console.error('[/tick error]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
-let lastTradeCloseTime = 0;
-const COOLDOWN_MS = 5 * 60 * 1000;
+// ── Dashboard signal endpoint (same as tick but for UI polling)
+app.get('/signal', async (req, res) => {
+  try {
+    const tradingState          = await loadTradingState();
+    const { allowed, reason }   = isTradingAllowed(tradingState);
+    const data    = await loadTrades();
+    const openTrade = data.open_trade;
 
-// ── Main Loop ─────────────────────────────────────────────
-// ── Session Check (6 PM – 11 PM IST = 12:30 UTC – 17:30 UTC) ──
-function isInSession() {
-    const now    = new Date();
-    const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
-    const start  = 12 * 60 + 30;  // 12:30 UTC = 18:00 IST
-    const end    = 17 * 60 + 30;  // 17:30 UTC = 23:00 IST
-    return utcMin >= start && utcMin < end;
-}
+    // For dashboard, just get current price without running full bot logic
+    let price = await fetchBTCPrice();
+    if (!price) price = openTrade?.entry_price || 0;
 
-async function runLoop() {
-    // Daily reset
-    const today = new Date().toDateString();
-    if (state.daily_stats.date !== today) {
-        console.log('🔄 Daily reset');
-        state.daily_stats = { trades: 0, loss: 0, profit: 0, date: today };
+    const livePL     = calcLivePL(openTrade, price);
+    const riskStatus = await getRiskStatus();
+
+    return res.json({
+      trading_allowed: allowed,
+      pause_reason:    reason,
+      price,
+      balance:         data.balance,
+      holding:         !!openTrade,
+      position_type:   openTrade?.type || null,
+      entry_price:     openTrade?.entry_price || null,
+      stop_loss:       openTrade?.stop_loss || null,
+      tp1_price:       openTrade?.tp1_price || null,
+      tp_levels:       openTrade?.tp_levels || [],
+      position_size:   openTrade?.amount || 0,
+      opened_at:       openTrade?.opened_at || null,
+      atr_at_entry:    openTrade?.atr_at_entry || null,
+      entry_reason:    openTrade?.entry_reason || null,
+      strategy:        openTrade?.strategy || null,
+      live_pl_inr:     livePL,
+      last_signal:     data.last_signal,
+      risk_status:     riskStatus,
+      force_start:     tradingState.force_start,
+      trading_hours:   { start: tradingState.start_hour, end: tradingState.end_hour }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Trade history
+app.get('/history', async (req, res) => {
+  try {
+    const data = await loadTrades();
+    res.json(data.history || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Order log
+app.get('/orders', async (req, res) => {
+  try {
+    const data = await loadTrades();
+    const log  = (data.order_log || []).filter(e => ['OPEN_LONG','OPEN_SHORT','STOP_LOSS','TP1_FULL_EXIT','CLOSE_LONG','CLOSE_SHORT','FORCE_CLOSE'].includes(e.action));
+    res.json([...log].reverse());
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Status
+app.get('/status', async (req, res) => {
+  try {
+    const data  = await loadTrades();
+    const price = await fetchBTCPrice();
+    const live  = calcLivePL(data.open_trade, price || 0);
+    const risk  = await getRiskStatus();
+    const ts    = await loadTradingState();
+    res.json({
+      balance:         parseFloat((data.balance || 0).toFixed(2)),
+      has_open_trade:  !!data.open_trade,
+      open_trade:      data.open_trade,
+      current_price:   price,
+      live_pl_inr:     live,
+      last_signal:     data.last_signal,
+      total_trades:    (data.history || []).length,
+      risk_status:     risk,
+      force_start:     ts.force_start,
+      start_balance:   START_BALANCE,
+      pnl:             parseFloat(((data.balance || START_BALANCE) - START_BALANCE).toFixed(2))
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Risk config
+app.get('/risk-config', async (req, res) => {
+  try { res.json(await loadRiskConfig()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/risk-config', async (req, res) => {
+  try {
+    await saveRiskConfig(req.body);
+    res.json({ success: true, message: 'Risk config updated' });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// ── Risk status
+app.get('/risk-status', async (req, res) => {
+  try { res.json(await getRiskStatus()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Trading control
+app.get('/trading-control', async (req, res) => {
+  try {
+    const state = await loadTradingState();
+    const { allowed, reason } = isTradingAllowed(state);
+    res.json({ state, trading_allowed: allowed, pause_reason: reason });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/trading-control', async (req, res) => {
+  try {
+    const { action } = req.body;
+    const state = await loadTradingState();
+
+    if (action === 'pause')       { state.manual_pause = true;  state.force_start = false; }
+    else if (action === 'resume') { state.manual_pause = false; state.force_start = false; }
+    else if (action === 'force_start') { state.manual_pause = false; state.force_start = true; }
+    else if (action === 'force_stop') {
+      const price = await fetchBTCPrice();
+      const data  = await loadTrades();
+      let msg = 'No open position';
+      if (data.open_trade && price) {
+        const rec = closeFullPosition(data, data.open_trade, price, 'Force Stop');
+        await recordTradeResult(rec.profit_inr);
+        data.order_log = data.order_log || [];
+        data.order_log.push({ time: new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}), side:'CLOSE', action:'FORCE_CLOSE', price, quantity: rec.amount, pl_inr: rec.profit_inr });
+        await saveTrades(data);
+        msg = `Closed @ $${price.toFixed(2)} | P/L: ₹${rec.profit_inr}`;
+      }
+      state.manual_pause = true; state.force_start = false;
+      await saveTradingState(state);
+      return res.json({ success: true, message: msg });
+    } else if (action === 'update_hours') {
+      state.start_hour = req.body.start_hour ?? 18;
+      state.end_hour   = req.body.end_hour   ?? 23;
+      state.enabled    = req.body.enabled    ?? true;
+    } else if (action === 'set_usdt_rate') {
+      // Store manual USDT rate override
+      await redisSet('usdt_rate_override', req.body.rate);
+      return res.json({ success: true, message: `USDT rate set to ₹${req.body.rate}` });
+    } else {
+      return res.status(400).json({ success: false, error: 'Unknown action' });
     }
 
-    // ── Session filter — only trade 6 PM to 11 PM IST ──────
-    if (!state.config.force_start && !isInSession()) {
-        const istTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
-        console.log('[' + istTime + ' IST] Outside session (18:00-23:00) — skipping Binance API call');
-        state.last_signal = 'Hold';
-        return;
-    }
+    await saveTradingState(state);
+    res.json({ success: true, message: `Action: ${action}` });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
 
-    const candles = await fetchCandles('5m', CANDLE_LIMIT);
-    if (!candles) return;
-    _lastCandles = candles; // store for /chart-data endpoint
+// ── USDT/INR rate (live or manual override)
+app.get('/usdt-rate', async (req, res) => {
+  try {
+    const override = await redisGet('usdt_rate_override');
+    if (override) return res.json({ rate: parseFloat(override), source: 'manual' });
+    // Try to fetch live rate from a free API
+    try {
+      const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const d = await r.json();
+        const rate = d.rates?.INR;
+        if (rate) return res.json({ rate: parseFloat(rate.toFixed(2)), source: 'live' });
+      }
+    } catch (_) {}
+    res.json({ rate: BTC_USDT_RATE, source: 'default' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-    const { price, signal, atr, stop } = processSignal(candles);
-    state.last_price    = price;
-    state.last_signal   = signal;
-    state.last_atr      = atr;
-    state.last_ut_stop  = stop;
-    state.usdt_inr_rate = BTC_USDT_RATE;
-    const atr14     = calcATR(candles, 14);
-    const n         = candles.length;
-    const prevAtr14 = atr14[n - 11] || 0;
-    state.last_prev_atr  = prevAtr14;
-    state.last_atr_expanding = atr > prevAtr14;
-    // Preview next lot size
-    state.last_lot_preview = calcLotSize(state.balance, atr, price, prevAtr14);
+// ── Reset balance (for testing)
+app.post('/reset', async (req, res) => {
+  try {
+    await saveTrades({ balance: START_BALANCE, open_trade: null, history: [], order_log: [], last_signal: null });
+    await saveRiskState({ daily_loss: 0, daily_profit: 0, daily_trades: 0, consecutive_losses: 0, last_reset: new Date().toISOString(), peak_balance: 0 });
+    res.json({ success: true, message: 'Balance and history reset' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-    console.log(`[${new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'})} IST] BTC: $${price.toFixed(2)} | Signal: ${signal}`);
+// ── Health check
+app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+app.get('/', (_, res) => res.send('UT Bot API running. Dashboard: use static index.html'));
 
-    const allowed = isTradingAllowed();
-    if (!allowed.allowed) {
-        console.log('⏸️  ' + allowed.reason);
-        return;
-    }
-
-    const trade = state.open_trade;
-    if (trade) {
-        const slHit = (trade.type === 'LONG'  && price <= trade.stop_loss) ||
-                      (trade.type === 'SHORT' && price >= trade.stop_loss);
-        const tpHit = (trade.type === 'LONG'  && price >= trade.tp1) ||
-                      (trade.type === 'SHORT' && price <= trade.tp1);
-        if (slHit)      { closeTrade(price, 'Stop-Loss Hit'); lastTradeCloseTime = Date.now(); await saveState(); }
-        else if (tpHit) { closeTrade(price, 'TP1 Hit');       lastTradeCloseTime = Date.now(); await saveState(); }
-        else {
-            const pl = trade.type === 'LONG'
-                ? (price - trade.entry_price) * trade.amount
-                : (trade.entry_price - price) * trade.amount;
-            console.log(`  Holding ${trade.type} | Live P/L: ₹${(pl * BTC_USDT_RATE).toFixed(2)}`);
-        }
-    } else if (signal === 'Buy' || signal === 'Sell') {
-        const cooldownOk = !lastTradeCloseTime || (Date.now() - lastTradeCloseTime > COOLDOWN_MS);
-        const tradesOk   = state.daily_stats.trades < state.config.risk.max_trades;
-        const lossOk     = state.daily_stats.loss   < state.config.risk.max_daily_loss;
-        if (cooldownOk && tradesOk && lossOk) {
-            const prevAtr = atr14[n - 11] || 0; // ATR 10 candles ago
-            openTrade(signal, price, atr, stop, prevAtr);
-            await saveState();
-        } else {
-            console.log('  Signal skipped — cooldown/limits');
-        }
-    }
-}
-
-// ── Boot ──────────────────────────────────────────────────
-async function main() {
-    console.log('🤖 Bot 1 (UT Bot) starting...');
-    await loadState();
-    await updateUSDTRate();           // fetch rate on startup
-    setInterval(updateUSDTRate, 60 * 60 * 1000); // refresh every hour
-    await runLoop();
-    setInterval(runLoop, LOOP_INTERVAL_MS);
-}
-
-main();
+// ─── Start ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🚀 UT Bot Trading Backend — port ${PORT}`);
+  console.log(`⏰ Trading hours: check /trading-control`);
+  console.log(`📊 Tick (cron): GET /tick`);
+  console.log(`${'='.repeat(60)}\n`);
+});

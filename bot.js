@@ -13,8 +13,8 @@ app.use(express.json());
 
 // ─── Upstash Redis Credentials ────────────────────────────────────────────────
 // Paste your Upstash credentials here directly:
-const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
-const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
+const REDIS_URL   = 'YOUR_UPSTASH_REDIS_REST_URL';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'YOUR_UPSTASH_REDIS_REST_TOKEN';  // e.g. AXxxxxxxxxxxxxxxxx
 
 async function redisCmd(...args) {
   const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
@@ -909,6 +909,119 @@ app.post('/reset', async (req, res) => {
     await saveRiskState({ daily_loss: 0, daily_profit: 0, daily_trades: 0, consecutive_losses: 0, last_reset: new Date().toISOString(), peak_balance: 0 });
     res.json({ success: true, message: 'Balance and history reset' });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Klines proxy: client sends klines, server runs UT Bot and returns signal
+// This solves Binance IP blocking on Render — browser fetches klines, server processes them
+app.post('/compute-signal', async (req, res) => {
+  try {
+    const { klines } = req.body;
+    if (!klines || !Array.isArray(klines) || klines.length < 10) {
+      return res.status(400).json({ error: 'klines array required' });
+    }
+
+    const r1 = calcUTBot(klines, 2, 1);
+    const r2 = calcUTBot(klines, 2, 300);
+
+    const price    = r1 ? r1.close : (r2 ? r2.close : 0);
+    let signal     = 'Hold';
+    let utbotStop  = price;
+
+    if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
+    if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+
+    const atr14  = calcStableATR(klines, 14);
+    const atr1   = r1 ? parseFloat(r1.atr.toFixed(2)) : 0;
+    const atr300 = r2 ? parseFloat(r2.atr.toFixed(2)) : 0;
+    const sig1   = !r1 ? 'N/A' : r1.signal === -1 ? 'SELL' : r1.signal === 1 ? 'BUY' : 'HOLD';
+    const sig2   = !r2 ? 'N/A' : r2.signal ===  1 ? 'BUY'  : r2.signal === -1 ? 'SELL' : 'HOLD';
+
+    console.log(`[compute-signal] ${signal} @ $${price.toFixed(2)} | ATR14=$${atr14.toFixed(2)} | #1=${sig1} stop=$${r1?.stopLine?.toFixed(0)} | #2=${sig2} stop=$${r2?.stopLine?.toFixed(0)}`);
+
+    const data        = await loadTrades();
+    const ts          = await loadTradingState();
+    const { allowed, reason } = isTradingAllowed(ts);
+    const openTrade   = data.open_trade;
+    const riskStatus  = await getRiskStatus();
+    const livePL      = calcLivePL(openTrade, price);
+
+    return res.json({
+      signal, price, atr: atr14, utbot_stop: utbotStop,
+      utbot1: { name:'UT Bot #1', params:'KV=2, ATR=1',   role:'Sell Signals', signal:sig1, raw:r1?.signal??0, stop_line:r1?parseFloat(r1.stopLine.toFixed(2)):0, atr:atr1 },
+      utbot2: { name:'UT Bot #2', params:'KV=2, ATR=300', role:'Buy Signals',  signal:sig2, raw:r2?.signal??0, stop_line:r2?parseFloat(r2.stopLine.toFixed(2)):0, atr:atr300 },
+      atr14: parseFloat(atr14.toFixed(2)), atr1, atr300,
+      trading_allowed: allowed, pause_reason: reason,
+      balance: data.balance, holding: !!openTrade,
+      position_type: openTrade?.type||null, entry_price: openTrade?.entry_price||null,
+      stop_loss: openTrade?.stop_loss||null, tp1_price: openTrade?.tp1_price||null,
+      tp_levels: openTrade?.tp_levels||[], position_size: openTrade?.amount||0,
+      opened_at: openTrade?.opened_at||null, atr_at_entry: openTrade?.atr_at_entry||null,
+      entry_reason: openTrade?.entry_reason||null, strategy: openTrade?.strategy||null,
+      live_pl_inr: livePL, last_signal: data.last_signal,
+      risk_status: riskStatus, force_start: ts.force_start,
+      ist_hour: getISTHour(), trading_hours: { start: ts.start_hour, end: ts.end_hour }
+    });
+  } catch (err) {
+    console.error('[/compute-signal error]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── /tick with client-provided klines (for when Binance blocks Render)
+app.post('/tick-with-klines', async (req, res) => {
+  try {
+    const { klines } = req.body;
+    if (!klines || !Array.isArray(klines) || klines.length < 10) {
+      return res.status(400).json({ error: 'klines array required' });
+    }
+
+    const tradingState        = await loadTradingState();
+    const { allowed, reason } = isTradingAllowed(tradingState);
+    const data                = await loadTrades();
+    const openTrade           = data.open_trade;
+
+    const r1 = calcUTBot(klines, 2, 1);
+    const r2 = calcUTBot(klines, 2, 300);
+    const price = r1 ? r1.close : (r2 ? r2.close : 0);
+    let signal = 'Hold';
+    let utbotStop = price;
+    if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
+    if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+    const atr14 = calcStableATR(klines, 14);
+
+    if (!allowed && !openTrade) {
+      return res.json({ status: 'sleeping', reason, trading_allowed: false });
+    }
+    if (!price) return res.json({ status: 'error', message: 'price=0 from klines' });
+
+    const riskStatus = await getRiskStatus();
+
+    if (!allowed) {
+      const slHit = openTrade && (openTrade.type==='LONG' ? price<=openTrade.stop_loss : price>=openTrade.stop_loss);
+      const tpHit = openTrade?.tp1_price && (openTrade.type==='LONG' ? price>=openTrade.tp1_price : price<=openTrade.tp1_price);
+      if (slHit || tpHit) {
+        const result = await updateDemoTrade(signal, price, atr14, utbotStop);
+        const reloaded = await loadTrades();
+        return res.json({ status:'sl_tp_hit', trading_allowed:false, pause_reason:reason, price, balance:reloaded.balance, action:result.actionMsg, last_closed:result.lastClosed });
+      }
+      return res.json({ status:'paused', trading_allowed:false, pause_reason:reason, price, signal:'Hold', balance:data.balance, holding:!!openTrade, live_pl_inr:calcLivePL(openTrade,price), risk_status:riskStatus });
+    }
+
+    console.log(`[tick-with-klines] ${signal} @ $${price.toFixed(2)}`);
+    const result   = await updateDemoTrade(signal, price, atr14, utbotStop);
+    const reloaded = await loadTrades();
+    return res.json({
+      status:'ok', trading_allowed:true, price, signal,
+      balance:reloaded.balance, holding:!!reloaded.open_trade,
+      position_type:reloaded.open_trade?.type||null, entry_price:reloaded.open_trade?.entry_price||null,
+      stop_loss:reloaded.open_trade?.stop_loss||null, tp1_price:reloaded.open_trade?.tp1_price||null,
+      action:result.actionMsg, live_pl_inr:calcLivePL(reloaded.open_trade,price),
+      atr:atr14, risk_status:riskStatus, last_closed:result.lastClosed, force_start:tradingState.force_start
+    });
+  } catch (err) {
+    console.error('[/tick-with-klines error]', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Debug time (check if IST hour is correct)

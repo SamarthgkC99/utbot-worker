@@ -166,74 +166,113 @@ async function fetchKlines(limit = 350) {
 
 // ─── UT Bot Logic ─────────────────────────────────────────────────────────────
 function calcUTBot(klines, keyvalue, atrPeriod) {
-  if (!klines || klines.length < atrPeriod + 5) return null;
-  const n = klines.length;
-  const close  = klines.map(k => parseFloat(k[4]));
-  const high   = klines.map(k => parseFloat(k[2]));
-  const low    = klines.map(k => parseFloat(k[3]));
-  const tr     = high.map((h, i) => h - low[i]);
+  if (!klines || klines.length < 2) return null;
+  const n     = klines.length;
+  const close = klines.map(k => parseFloat(k[4]));
+  const high  = klines.map(k => parseFloat(k[2]));
+  const low   = klines.map(k => parseFloat(k[3]));
 
-  // Rolling ATR (simple moving average)
+  // True Range = high - low (matching Python: df["tr"] = df["high"] - df["low"])
+  const tr = high.map((h, i) => h - low[i]);
+
+  // Rolling ATR — same as Python pandas rolling().mean()
+  // For indices before atrPeriod-1, use average of available values (pandas NaN → we use 0)
   const atr = new Array(n).fill(0);
-  for (let i = atrPeriod - 1; i < n; i++) {
-    atr[i] = tr.slice(i - atrPeriod + 1, i + 1).reduce((s, v) => s + v, 0) / atrPeriod;
+  for (let i = 0; i < n; i++) {
+    if (i < atrPeriod - 1) {
+      // not enough data yet — use average of what we have (avoids 0 nLoss early on)
+      atr[i] = tr.slice(0, i + 1).reduce((s, v) => s + v, 0) / (i + 1);
+    } else {
+      atr[i] = tr.slice(i - atrPeriod + 1, i + 1).reduce((s, v) => s + v, 0) / atrPeriod;
+    }
   }
 
   const nLoss = atr.map(a => keyvalue * a);
-  const stop  = [close[0]];
-  const pos   = [0];
+
+  // Trailing stop — exact port of Python loop
+  const stop = [close[0]];
+  const pos  = [0];
 
   for (let i = 1; i < n; i++) {
     const prev = stop[i - 1];
     const src  = close[i];
     const src1 = close[i - 1];
     let newStop;
-    if (src > prev && src1 > prev)       newStop = Math.max(prev, src - nLoss[i]);
-    else if (src < prev && src1 < prev)  newStop = Math.min(prev, src + nLoss[i]);
-    else                                  newStop = src > prev ? src - nLoss[i] : src + nLoss[i];
+
+    if (src > prev && src1 > prev)
+      newStop = Math.max(prev, src - nLoss[i]);
+    else if (src < prev && src1 < prev)
+      newStop = Math.min(prev, src + nLoss[i]);
+    else
+      newStop = src > prev ? src - nLoss[i] : src + nLoss[i];
+
     stop.push(newStop);
+
     if (src1 < prev && src > prev)       pos.push(1);
     else if (src1 > prev && src < prev)  pos.push(-1);
     else                                  pos.push(pos[i - 1]);
   }
 
-  const stableAtr = atr.filter(v => v > 0);
-  const atrStable = stableAtr.length ? stableAtr[stableAtr.length - 1] : 0;
+  // Use last valid ATR value
+  const lastAtr = atr[n - 1] || 0;
 
   return {
     signal:   pos[n - 1],
     stopLine: stop[n - 1],
-    atr:      atrStable,
+    atr:      lastAtr,
     close:    close[n - 1]
   };
 }
 
 async function getUTBotSignal() {
-  const klines = await fetchKlines(350);
-  if (!klines) return { signal: 'No Data', price: 0, atr: 0, utbot_stop: 0 };
+  // Fetch 500 candles — gives ATR=300 plenty of warmup (Python uses 350, we use more for safety)
+  const klines = await fetchKlines(500);
+  if (!klines || klines.length < 10) {
+    console.error('[UT Bot] Failed to fetch klines');
+    return { signal: 'No Data', price: 0, atr: 0, utbot_stop: 0,
+             utbot1: null, utbot2: null, atr14: 0, atr1: 0, atr300: 0 };
+  }
 
-  const r1 = calcUTBot(klines, 2, 1);    // UT Bot #1 — KV=2, ATR=1   → Sell signals
-  const r2 = calcUTBot(klines, 2, 300);  // UT Bot #2 — KV=2, ATR=300 → Buy signals
+  // Exact match to Python: calc_utbot(df.copy(), 2, 1) and calc_utbot(df.copy(), 2, 300)
+  const r1 = calcUTBot(klines, 2, 1);    // UT Bot #1: KV=2, ATR=1   → Sell Only
+  const r2 = calcUTBot(klines, 2, 300);  // UT Bot #2: KV=2, ATR=300 → Buy Only
 
-  const price = r1 ? r1.close : 0;
-  let signal    = 'Hold';
-  let utbotStop = price;
+  const price    = r1 ? r1.close : (r2 ? r2.close : 0);
+  let signal     = 'Hold';
+  let utbotStop  = price;
 
+  // Exact match to Python signal priority: Buy checked first, then Sell overrides
   if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
   if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
 
   const atr14  = calcStableATR(klines, 14);
-  const atr1   = r1 ? parseFloat(r1.atr.toFixed(2))   : 0;
-  const atr300 = r2 ? parseFloat(r2.atr.toFixed(2))   : 0;
+  const atr1   = r1 ? parseFloat(r1.atr.toFixed(2))  : 0;
+  const atr300 = r2 ? parseFloat(r2.atr.toFixed(2))  : 0;
 
-  const sig1 = r1 ? (r1.signal === -1 ? 'SELL' : r1.signal === 1 ? 'BUY' : 'HOLD') : 'N/A';
-  const sig2 = r2 ? (r2.signal ===  1 ? 'BUY'  : r2.signal === -1 ? 'SELL' : 'HOLD') : 'N/A';
+  const sig1 = !r1 ? 'N/A' : r1.signal === -1 ? 'SELL' : r1.signal === 1 ? 'BUY' : 'HOLD';
+  const sig2 = !r2 ? 'N/A' : r2.signal ===  1 ? 'BUY'  : r2.signal === -1 ? 'SELL' : 'HOLD';
 
-  console.log(`[UT Bot] ${signal} @ $${price.toFixed(2)} | ATR14: ${atr14.toFixed(2)} | #1(ATR1)=${sig1} stop=$${r1?.stopLine?.toFixed(0)} | #2(ATR300)=${sig2} stop=$${r2?.stopLine?.toFixed(0)}`);
+  // Matching Python print output
+  console.log('='.repeat(60));
+  console.log(`BTCUSDT: $${price.toFixed(2)}`);
+  console.log(`ATR (14-period): $${atr14.toFixed(2)}`);
+  console.log('='.repeat(60));
+  if (r2 && r2.signal === 1)
+    console.log(`[BUY]  UT Bot #2 (KV=2, ATR=300): BUY signal | Stop: $${r2.stopLine.toFixed(2)}`);
+  else
+    console.log(`[    ] UT Bot #2 (KV=2, ATR=300): Hold`);
+  if (r1 && r1.signal === -1)
+    console.log(`[SELL] UT Bot #1 (KV=2, ATR=1):   SELL signal | Stop: $${r1.stopLine.toFixed(2)}`);
+  else
+    console.log(`[    ] UT Bot #1 (KV=2, ATR=1):   Hold`);
+  console.log(`Final Signal: ${signal}`);
+  console.log('='.repeat(60));
 
   return {
-    signal, price, atr: atr14, utbot_stop: utbotStop,
-    // Full UT Bot details for dashboard
+    signal,
+    price,
+    atr:        atr14,
+    utbot_stop: utbotStop,
     utbot1: {
       name:      'UT Bot #1',
       params:    'KV=2, ATR=1',
@@ -266,13 +305,14 @@ function calcStableATR(klines, period = 14) {
 }
 
 // ─── Risk Management ──────────────────────────────────────────────────────────
-function calcPositionSize(balance, config) {
+function calcPositionSize(balance, config, btcPrice = 84000) {
   const { method, value, min_position_size, max_position_size } = config.position_sizing;
   let size;
   if (method === 'fixed') {
     size = value;
   } else if (method === 'percentage') {
-    const btcPriceINR = 97000 * BTC_USDT_RATE;
+    // (balance * pct%) / (BTC price in INR)
+    const btcPriceINR = btcPrice * BTC_USDT_RATE;
     size = (balance * (value / 100)) / btcPriceINR;
   } else {
     size = value;
@@ -442,7 +482,7 @@ async function updateDemoTrade(signal, price, atr, utbotStop) {
   let lastClosed = null;
 
   const ts = () => new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  const logEntry = { time: ts(), side: signal, price, quantity: calcPositionSize(data.balance, config) };
+  const logEntry = { time: ts(), side: signal, price, quantity: calcPositionSize(data.balance, config, price) };
 
   // ── Check open trade for SL / TP hits ──
   if (openTrade) {
@@ -494,7 +534,7 @@ async function updateDemoTrade(signal, price, atr, utbotStop) {
         logEntry.action = 'CLOSE_SHORT'; logEntry.pl_inr = lastClosed.profit_inr;
         openTrade = null;
       }
-      const size  = calcPositionSize(data.balance, config);
+      const size  = calcPositionSize(data.balance, config, price);
       const sl    = calcStopLoss(price, 'LONG', atr, utbotStop, config);
       const tpArr = calcTP(price, 'LONG', atr, config);
       const tp1   = tpArr[0]?.price || null;
@@ -531,7 +571,7 @@ async function updateDemoTrade(signal, price, atr, utbotStop) {
         logEntry.action = 'CLOSE_LONG'; logEntry.pl_inr = lastClosed.profit_inr;
         openTrade = null;
       }
-      const size  = calcPositionSize(data.balance, config);
+      const size  = calcPositionSize(data.balance, config, price);
       const sl    = calcStopLoss(price, 'SHORT', atr, utbotStop, config);
       const tpArr = calcTP(price, 'SHORT', atr, config);
       const tp1   = tpArr[0]?.price || null;

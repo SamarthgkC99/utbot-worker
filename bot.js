@@ -13,8 +13,8 @@ app.use(express.json());
 
 // ─── Upstash Redis Credentials ────────────────────────────────────────────────
 // Paste your Upstash credentials here directly:
-const REDIS_URL   = 'YOUR_UPSTASH_REDIS_REST_URL';    // e.g. https://xxx.upstash.io
-const REDIS_TOKEN = 'YOUR_UPSTASH_REDIS_REST_TOKEN';  // e.g. AXxxxxxxxxxxxxxxxx
+const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
 
 async function redisCmd(...args) {
   const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
@@ -702,26 +702,38 @@ app.get('/orders', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Status
+// ── Status — fast Redis-only, NO Binance call (used by dashboard on load)
 app.get('/status', async (req, res) => {
   try {
-    const data  = await loadTrades();
-    const price = await fetchBTCPrice();
-    const live  = calcLivePL(data.open_trade, price || 0);
-    const risk  = await getRiskStatus();
-    const ts    = await loadTradingState();
+    const [data, risk, ts] = await Promise.all([loadTrades(), getRiskStatus(), loadTradingState()]);
+    const open  = data.open_trade;
+    const bal   = parseFloat((data.balance || START_BALANCE).toFixed(2));
+    const { allowed, reason } = isTradingAllowed(ts);
     res.json({
-      balance:         parseFloat((data.balance || 0).toFixed(2)),
-      has_open_trade:  !!data.open_trade,
-      open_trade:      data.open_trade,
-      current_price:   price,
-      live_pl_inr:     live,
+      balance:         bal,
+      pnl:             parseFloat((bal - START_BALANCE).toFixed(2)),
+      has_open_trade:  !!open,
+      open_trade:      open,
+      holding:         !!open,
+      position_type:   open?.type || null,
+      entry_price:     open?.entry_price || null,
+      stop_loss:       open?.stop_loss || null,
+      tp1_price:       open?.tp1_price || null,
+      tp_levels:       open?.tp_levels || [],
+      position_size:   open?.amount || 0,
+      opened_at:       open?.opened_at || null,
+      atr_at_entry:    open?.atr_at_entry || null,
+      entry_reason:    open?.entry_reason || null,
+      strategy:        open?.strategy || null,
       last_signal:     data.last_signal,
-      total_trades:    (data.history || []).length,
+      total_trades:    (data.history || []).filter(t => t.exit_price).length,
       risk_status:     risk,
+      trading_allowed: allowed,
+      pause_reason:    reason,
       force_start:     ts.force_start,
-      start_balance:   START_BALANCE,
-      pnl:             parseFloat(((data.balance || START_BALANCE) - START_BALANCE).toFixed(2))
+      ist_hour:        getISTHour(),
+      trading_hours:   { start: ts.start_hour, end: ts.end_hour },
+      start_balance:   START_BALANCE
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

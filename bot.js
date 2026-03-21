@@ -13,8 +13,8 @@ app.use(express.json());
 
 // ─── Upstash Redis Credentials ────────────────────────────────────────────────
 // Paste your Upstash credentials here directly:
-const REDIS_URL   = 'YOUR_UPSTASH_REDIS_REST_URL';    // e.g. https://xxx.upstash.io
-const REDIS_TOKEN = 'YOUR_UPSTASH_REDIS_REST_TOKEN';  // e.g. AXxxxxxxxxxxxxxxxx
+const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
+const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
 
 async function redisCmd(...args) {
   const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;

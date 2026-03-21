@@ -16,11 +16,27 @@ app.use(express.json());
 const REDIS_URL   = 'https://robust-kitten-78595.upstash.io';    // e.g. https://xxx.upstash.io
 const REDIS_TOKEN = 'gQAAAAAAATMDAAIncDEyZjJkNzQyMDQyN2Q0ODEwOTI1ZGY4MTczMWM4MGQzYnAxNzg1OTU';  // e.g. AXxxxxxxxxxxxxxxxx
 
+// ── Validate credentials on startup ──────────────────────────────────────────
+if (!REDIS_URL || REDIS_URL.includes('YOUR_UPSTASH')) {
+  console.error('FATAL: REDIS_URL not set. Replace YOUR_UPSTASH_REDIS_REST_URL in bot.js with your actual Upstash URL');
+  process.exit(1);
+}
+if (!REDIS_TOKEN || REDIS_TOKEN.includes('YOUR_UPSTASH')) {
+  console.error('FATAL: REDIS_TOKEN not set. Replace YOUR_UPSTASH_REDIS_REST_TOKEN in bot.js with your actual token');
+  process.exit(1);
+}
+console.log('[Redis] Credentials found, connecting to:', REDIS_URL.substring(0,40) + '...');
+
 async function redisCmd(...args) {
-  const url = `${REDIS_URL}/${args.map(encodeURIComponent).join('/')}`;
+  const url = REDIS_URL + '/' + args.map(encodeURIComponent).join('/');
   const res  = await fetch(url, {
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    headers: { Authorization: 'Bearer ' + REDIS_TOKEN },
+    signal:  AbortSignal.timeout(8000)
   });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error('Redis HTTP ' + res.status + ': ' + txt);
+  }
   const data = await res.json();
   return data.result;
 }

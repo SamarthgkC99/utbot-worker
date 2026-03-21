@@ -182,17 +182,13 @@ async function fetchKlines(limit = 350) {
 
 // ─── UT Bot Logic ─────────────────────────────────────────────────────────────
 function calcUTBot(klines, keyvalue, atrPeriod) {
-  // ── Exact Pine Script port ──────────────────────────────────────────────────
-  // Pine uses Wilder's RMA (EMA-style) for ATR, but the Python version uses SMA.
-  // We match the Python/original utbot_logic.py here: SMA rolling ATR.
   if (!klines || klines.length < 2) return null;
   const n     = klines.length;
   const close = klines.map(k => parseFloat(k[4]));
   const high  = klines.map(k => parseFloat(k[2]));
   const low   = klines.map(k => parseFloat(k[3]));
-  const tr    = high.map((h, i) => h - low[i]);  // TR = high - low (matches Python)
+  const tr    = high.map((h, i) => h - low[i]);
 
-  // SMA rolling ATR
   const atr = new Array(n).fill(0);
   for (let i = 0; i < n; i++) {
     const window = tr.slice(Math.max(0, i - atrPeriod + 1), i + 1);
@@ -200,11 +196,8 @@ function calcUTBot(klines, keyvalue, atrPeriod) {
   }
   const nLoss = atr.map(a => keyvalue * a);
 
-  // ── Trailing stop (Pine Script iff logic) ───────────────────────────────────
-  // nz(xATRTrailingStop[1], 0) → previous stop, defaulting to 0
   const stop = new Array(n).fill(0);
-  stop[0] = close[0];  // initialise first candle
-
+  stop[0] = close[0];
   for (let i = 1; i < n; i++) {
     const prevStop = stop[i - 1];
     const src      = close[i];
@@ -218,32 +211,25 @@ function calcUTBot(klines, keyvalue, atrPeriod) {
       stop[i] = src > prevStop ? src - nLoss[i] : src + nLoss[i];
   }
 
-  // ── Position (Pine Script crossover/crossunder logic) ──────────────────────
-  // pos = +1 when price crosses ABOVE stop (buy cross)
-  // pos = -1 when price crosses BELOW stop (sell cross)
-  // pos carries forward (nz(pos[1], 0)) until next cross
   const pos = new Array(n).fill(0);
   for (let i = 1; i < n; i++) {
     const prevStop = stop[i - 1];
     const src      = close[i];
     const src1     = close[i - 1];
 
-    if (src1 < prevStop && src > prevStop)       pos[i] = 1;   // crossover  → BUY
-    else if (src1 > prevStop && src < prevStop)  pos[i] = -1;  // crossunder → SELL
+    if (src1 < prevStop && src > prevStop)       pos[i] = 1;
+    else if (src1 > prevStop && src < prevStop)  pos[i] = -1;
     else                                          pos[i] = pos[i - 1];
   }
 
-  // ── Cross detection on the LAST candle ─────────────────────────────────────
-  // Pine: buy = crossover(src, xATRTrailingStop)  → fires only on the exact candle of cross
-  // We check last TWO candles to see if a cross just happened
-  const justBuy  = close[n-2] < stop[n-2] && close[n-1] > stop[n-1];  // crossover
-  const justSell = close[n-2] > stop[n-2] && close[n-1] < stop[n-1];  // crossunder
+  const justBuy  = close[n-2] < stop[n-2] && close[n-1] > stop[n-1];
+  const justSell = close[n-2] > stop[n-2] && close[n-1] < stop[n-1];
 
   return {
-    pos:       pos[n - 1],      // current position state (+1/-1/0)
-    signal:    pos[n - 1],      // kept for compatibility
-    justBuy,                    // true only on the exact cross candle
-    justSell,                   // true only on the exact cross candle
+    pos:       pos[n - 1],
+    signal:    pos[n - 1],
+    justBuy,
+    justSell,
     stopLine:  stop[n - 1],
     prevStop:  stop[n - 2],
     atr:       atr[n - 1] || 0,
@@ -260,32 +246,23 @@ async function getUTBotSignal() {
              utbot1: null, utbot2: null, atr14: 0, atr1: 0, atr300: 0 };
   }
 
-  // ── Your exact TradingView settings (from screenshot) ──────────────────────
-  // UT Bot #1: KV=2, ATR=1   → watches for SELL cross (Sell #1 checked in Style)
-  // UT Bot #2: KV=2, ATR=300 → watches for BUY cross  (Buy #2 checked in Style)
-  const r1 = calcUTBot(klines, 2, 1);    // KV=2, ATR=1   → Sell signals
-  const r2 = calcUTBot(klines, 2, 300);  // KV=2, ATR=300 → Buy signals
+  const r1 = calcUTBot(klines, 2, 1);
+  const r2 = calcUTBot(klines, 2, 300);
 
   const price = r1 ? r1.close : (r2 ? r2.close : 0);
   let signal    = 'Hold';
   let utbotStop = price;
 
-  // ── Pine Script crossover logic ─────────────────────────────────────────────
-  // BUY  = crossover(src, xATRTrailingStop2) → price just crossed ABOVE UT Bot #2 stop
-  // SELL = crossunder(src, xATRTrailingStop1) → price just crossed BELOW UT Bot #1 stop
-  // Using justBuy/justSell (cross event on last candle) — same as Pine plotshape triggers
   if (r2 && r2.justBuy)   { signal = 'Buy';  utbotStop = r2.stopLine; }
   if (r1 && r1.justSell)  { signal = 'Sell'; utbotStop = r1.stopLine; }
 
-  // Also track current position state for dashboard display
-  const pos1 = r1 ? r1.pos : 0;   // +1 = above stop, -1 = below stop
+  const pos1 = r1 ? r1.pos : 0;
   const pos2 = r2 ? r2.pos : 0;
 
   const atr14  = calcStableATR(klines, 14);
   const atr1   = r1 ? parseFloat(r1.atr.toFixed(2))  : 0;
   const atr300 = r2 ? parseFloat(r2.atr.toFixed(2))  : 0;
 
-  // Dashboard signal labels
   const sig1state = pos1 ===  1 ? 'ABOVE STOP' : pos1 === -1 ? 'BELOW STOP' : 'HOLD';
   const sig2state = pos2 ===  1 ? 'ABOVE STOP' : pos2 === -1 ? 'BELOW STOP' : 'HOLD';
 
@@ -324,7 +301,99 @@ async function getUTBotSignal() {
   };
 }
 
+// ─── Helper Functions (previously missing) ─────────────────────────────────────
+function calcStableATR(klines, period) {
+  const tr = klines.map(k => parseFloat(k[2]) - parseFloat(k[3]));
+  if (tr.length < period) return 0;
+  const sum = tr.slice(-period).reduce((a,b) => a + b, 0);
+  return sum / period;
+}
 
+function calcLivePL(trade, currentPrice) {
+  if (!trade || !trade.entry_price) return 0;
+  const diff = trade.type === 'LONG' ? currentPrice - trade.entry_price : trade.entry_price - currentPrice;
+  const usdtPL = diff * trade.amount;
+  return usdtPL * BTC_USDT_RATE;
+}
+
+function calcPositionSize(balance, riskConfig, price) {
+  const pct = riskConfig.position_sizing.value / 100;
+  const usdtValue = balance * pct / BTC_USDT_RATE;
+  let size = usdtValue / price;
+  size = Math.min(riskConfig.position_sizing.max_position_size, size);
+  size = Math.max(riskConfig.position_sizing.min_position_size, size);
+  return parseFloat(size.toFixed(6));
+}
+
+function calcStopLoss(price, type, atr, utbotStop, config) {
+  const mult = config.stop_loss.atr_multiplier;
+  const atrDist = atr * mult;
+  let sl = type === 'LONG' ? price - atrDist : price + atrDist;
+  if (type === 'LONG' && utbotStop && utbotStop > sl) sl = utbotStop;
+  if (type === 'SHORT' && utbotStop && utbotStop < sl) sl = utbotStop;
+  return parseFloat(sl.toFixed(2));
+}
+
+function calcTP(price, type, atr, config) {
+  const mults = config.different_rules_for_position_type.enabled
+    ? config.different_rules_for_position_type[type.toLowerCase()].tp_atr_multipliers
+    : config.take_profit.levels.map(l => l.atr_multiplier);
+  return mults.map(mult => ({
+    price: type === 'LONG' ? price + atr * mult : price - atr * mult,
+    multiplier: mult
+  }));
+}
+
+function closeFullPosition(data, trade, exitPrice, reason) {
+  const diff = trade.type === 'LONG' ? exitPrice - trade.entry_price : trade.entry_price - exitPrice;
+  const usdtPL = diff * trade.amount;
+  const profitINR = usdtPL * BTC_USDT_RATE;
+  const closed = {
+    ...trade,
+    exit_price: exitPrice,
+    profit_inr: profitINR,
+    closed_at: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    exit_reason: reason,
+    duration: '...'
+  };
+  data.history = data.history || [];
+  data.history.push(closed);
+  data.balance += profitINR;
+  data.open_trade = null;
+  return closed;
+}
+
+async function recordTradeResult(profitINR) {
+  const riskState = await loadRiskState();
+  if (profitINR > 0) {
+    riskState.daily_profit += profitINR;
+    riskState.consecutive_losses = 0;
+  } else {
+    riskState.daily_loss += Math.abs(profitINR);
+    riskState.consecutive_losses += 1;
+  }
+  riskState.daily_trades += 1;
+  await saveRiskState(riskState);
+}
+
+function isTradingAllowed(tradingState) {
+  const now = new Date();
+  const istHour = now.getUTCHours() + 5.5; // approximate
+  const hour = Math.floor(istHour % 24);
+  const inHours = hour >= tradingState.start_hour && hour < tradingState.end_hour;
+  if (tradingState.force_start) return { allowed: true, reason: 'Force start active' };
+  if (tradingState.manual_pause) return { allowed: false, reason: 'Manually paused' };
+  if (!inHours) return { allowed: false, reason: `Outside trading hours (${tradingState.start_hour}:00–${tradingState.end_hour}:00 IST)` };
+  return { allowed: true, reason: '' };
+}
+
+function getISTHour() {
+  const now = new Date();
+  const ist = new Date(now.getTime() + (5.5 * 3600000));
+  return ist.getHours();
+}
+
+// ─── Core Trading Logic ───────────────────────────────────────────────────────
 async function updateDemoTrade(signal, price, atr, utbotStop) {
   signal = signal.charAt(0).toUpperCase() + signal.slice(1).toLowerCase();
   const data    = await loadTrades();
@@ -450,11 +519,9 @@ async function updateDemoTrade(signal, price, atr, utbotStop) {
   data.open_trade = openTrade;
   if (!data.order_log) data.order_log = [];
   data.order_log.push(logEntry);
-  // Keep only last 500 log entries in Redis to avoid size issues
   if (data.order_log.length > 500) data.order_log = data.order_log.slice(-500);
   await saveTrades(data);
 
-  // Update peak balance
   const riskState = await loadRiskState();
   if (data.balance > (riskState.peak_balance || 0)) {
     riskState.peak_balance = data.balance;
@@ -462,6 +529,34 @@ async function updateDemoTrade(signal, price, atr, utbotStop) {
   }
 
   return { data, openTrade, lastClosed, logEntry, actionMsg };
+}
+
+// ─── Additional helper for checking if new trade is allowed by risk limits ───
+async function canOpenTrade(currentBalance) {
+  const config = await loadRiskConfig();
+  const state  = await loadRiskState();
+
+  // Daily limits
+  if (config.daily_limits.enabled) {
+    if (state.daily_trades >= config.daily_limits.max_daily_trades)
+      return { allowed: false, reason: 'Daily trade limit reached' };
+    if (state.daily_loss >= config.daily_limits.max_daily_loss)
+      return { allowed: false, reason: 'Daily loss limit reached' };
+    if (state.consecutive_losses >= config.daily_limits.max_consecutive_losses)
+      return { allowed: false, reason: 'Max consecutive losses reached' };
+  }
+
+  // Account protection
+  if (config.account_protection.enabled) {
+    const peak = state.peak_balance || START_BALANCE;
+    const drawdown = (peak - currentBalance) / peak * 100;
+    if (drawdown >= config.account_protection.max_drawdown_percentage)
+      return { allowed: false, reason: `Max drawdown (${drawdown.toFixed(1)}%) reached` };
+    if (currentBalance < config.account_protection.min_balance)
+      return { allowed: false, reason: 'Min balance breached' };
+  }
+
+  return { allowed: true, reason: '' };
 }
 
 // ─── Risk Status Helper ───────────────────────────────────────────────────────
@@ -486,7 +581,6 @@ async function getRiskStatus() {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// ── Cron-job.org ping: runs the bot logic
 app.get('/tick', async (req, res) => {
   try {
     const tradingState        = await loadTradingState();
@@ -494,14 +588,11 @@ app.get('/tick', async (req, res) => {
     const data                = await loadTrades();
     const openTrade           = data.open_trade;
 
-    // ── SLEEP MODE: outside hours AND no open position ──────────────────────
-    // Do NOT hit Binance at all. Just ping-back so cron knows we are alive.
     if (!allowed && !openTrade) {
       console.log(`[tick] Sleeping — ${reason}`);
       return res.json({ status: 'sleeping', reason, trading_allowed: false });
     }
 
-    // ── We need price (either active trading OR open position needs SL/TP check)
     const { signal, price, atr, utbot_stop } = await getUTBotSignal();
 
     if (signal === 'No Data' || price === 0) {
@@ -511,7 +602,6 @@ app.get('/tick', async (req, res) => {
     const livePL     = calcLivePL(openTrade, price);
     const riskStatus = await getRiskStatus();
 
-    // ── PAUSED but open position exists: only check SL/TP, no new trades ────
     if (!allowed) {
       const slHit = openTrade && (openTrade.type === 'LONG' ? price <= openTrade.stop_loss : price >= openTrade.stop_loss);
       const tpHit = openTrade?.tp1_price && (openTrade.type === 'LONG' ? price >= openTrade.tp1_price : price <= openTrade.tp1_price);
@@ -533,7 +623,6 @@ app.get('/tick', async (req, res) => {
       });
     }
 
-    // ── ACTIVE TRADING ───────────────────────────────────────────────────────
     console.log(`[tick] Trading ACTIVE | ${signal} @ $${price.toFixed(2)}`);
     const result   = await updateDemoTrade(signal, price, atr, utbot_stop);
     const reloaded = await loadTrades();
@@ -563,7 +652,6 @@ app.get('/tick', async (req, res) => {
   }
 });
 
-// ── Dashboard signal endpoint — runs full UT Bot calc and returns all signal details
 app.get('/signal', async (req, res) => {
   try {
     const tradingState        = await loadTradingState();
@@ -572,7 +660,6 @@ app.get('/signal', async (req, res) => {
     const openTrade           = data.open_trade;
     const istHr               = getISTHour();
 
-    // Run full UT Bot signal calc (fetches Binance + calculates both instances)
     const sigData = await getUTBotSignal();
     const price   = sigData.price || openTrade?.entry_price || 0;
 
@@ -589,8 +676,8 @@ app.get('/signal', async (req, res) => {
       atr1:            sigData.atr1,
       atr300:          sigData.atr300,
       utbot_stop:      sigData.utbot_stop,
-      utbot1:          sigData.utbot1,   // UT Bot #1 full details
-      utbot2:          sigData.utbot2,   // UT Bot #2 full details
+      utbot1:          sigData.utbot1,
+      utbot2:          sigData.utbot2,
       balance:         data.balance,
       holding:         !!openTrade,
       position_type:   openTrade?.type || null,
@@ -615,7 +702,6 @@ app.get('/signal', async (req, res) => {
   }
 });
 
-// ── Trade history
 app.get('/history', async (req, res) => {
   try {
     const data = await loadTrades();
@@ -623,7 +709,6 @@ app.get('/history', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Order log
 app.get('/orders', async (req, res) => {
   try {
     const data = await loadTrades();
@@ -632,7 +717,6 @@ app.get('/orders', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Status — fast Redis-only, NO Binance call (used by dashboard on load)
 app.get('/status', async (req, res) => {
   try {
     const [data, risk, ts] = await Promise.all([loadTrades(), getRiskStatus(), loadTradingState()]);
@@ -668,7 +752,6 @@ app.get('/status', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Risk config
 app.get('/risk-config', async (req, res) => {
   try { res.json(await loadRiskConfig()); }
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -681,13 +764,11 @@ app.post('/risk-config', async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// ── Risk status
 app.get('/risk-status', async (req, res) => {
   try { res.json(await getRiskStatus()); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Trading control
 app.get('/trading-control', async (req, res) => {
   try {
     const state = await loadTradingState();
@@ -724,7 +805,6 @@ app.post('/trading-control', async (req, res) => {
       state.end_hour   = req.body.end_hour   ?? 23;
       state.enabled    = req.body.enabled    ?? true;
     } else if (action === 'set_usdt_rate') {
-      // Store manual USDT rate override
       await redisSet('usdt_rate_override', req.body.rate);
       return res.json({ success: true, message: `USDT rate set to ₹${req.body.rate}` });
     } else {
@@ -736,12 +816,10 @@ app.post('/trading-control', async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// ── USDT/INR rate (live or manual override)
 app.get('/usdt-rate', async (req, res) => {
   try {
     const override = await redisGet('usdt_rate_override');
     if (override) return res.json({ rate: parseFloat(override), source: 'manual' });
-    // Try to fetch live rate from a free API
     try {
       const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
       if (r.ok) {
@@ -754,7 +832,6 @@ app.get('/usdt-rate', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Reset balance (for testing)
 app.post('/reset', async (req, res) => {
   try {
     await saveTrades({ balance: START_BALANCE, open_trade: null, history: [], order_log: [], last_signal: null });
@@ -763,8 +840,6 @@ app.post('/reset', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Klines proxy: client sends klines, server runs UT Bot and returns signal
-// This solves Binance IP blocking on Render — browser fetches klines, server processes them
 app.post('/compute-signal', async (req, res) => {
   try {
     const { klines } = req.body;
@@ -819,7 +894,6 @@ app.post('/compute-signal', async (req, res) => {
   }
 });
 
-// ── /tick with client-provided klines (for when Binance blocks Render)
 app.post('/tick-with-klines', async (req, res) => {
   try {
     const { klines } = req.body;
@@ -876,7 +950,6 @@ app.post('/tick-with-klines', async (req, res) => {
   }
 });
 
-// ── Debug time (check if IST hour is correct)
 app.get('/debug-time', async (req, res) => {
   const ts    = await loadTradingState();
   const istHr = getISTHour();
@@ -891,11 +964,9 @@ app.get('/debug-time', async (req, res) => {
   });
 });
 
-// ── Health check
 app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString(), ist_hour: getISTHour() }));
 app.get('/', (_, res) => res.send('UT Bot API running. Dashboard: use static index.html'));
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n${'='.repeat(60)}`);

@@ -854,8 +854,9 @@ app.post('/compute-signal', async (req, res) => {
     let signal     = 'Hold';
     let utbotStop  = price;
 
-    if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
-    if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+    // ✅ FIX: use cross detection (justBuy / justSell)
+    if (r2 && r2.justBuy)   { signal = 'Buy';  utbotStop = r2.stopLine; }
+    if (r1 && r1.justSell)  { signal = 'Sell'; utbotStop = r1.stopLine; }
 
     const atr14  = calcStableATR(klines, 14);
     const atr1   = r1 ? parseFloat(r1.atr.toFixed(2)) : 0;
@@ -911,8 +912,11 @@ app.post('/tick-with-klines', async (req, res) => {
     const price = r1 ? r1.close : (r2 ? r2.close : 0);
     let signal = 'Hold';
     let utbotStop = price;
-    if (r2 && r2.signal === 1)  { signal = 'Buy';  utbotStop = r2.stopLine; }
-    if (r1 && r1.signal === -1) { signal = 'Sell'; utbotStop = r1.stopLine; }
+
+    // ✅ FIX: use cross detection (justBuy / justSell)
+    if (r2 && r2.justBuy)   { signal = 'Buy';  utbotStop = r2.stopLine; }
+    if (r1 && r1.justSell)  { signal = 'Sell'; utbotStop = r1.stopLine; }
+
     const atr14 = calcStableATR(klines, 14);
 
     if (!allowed && !openTrade) {
